@@ -6,6 +6,7 @@ const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 const http = require('http');
 const socketIo = require('socket.io');
+const { startCronJobs } = require('./jobs/subscriptionCron');
 require('dotenv').config();
 
 const app = express();
@@ -71,6 +72,9 @@ app.use('/api/campaigns', require('./routes/campaigns'));
 app.use('/api/email-tracking', require('./routes/email-tracking'));
 app.use('/api/whatsapp-web', require('./routes/whatsapp-web'));
 
+// New subscription routes with Cashfree integration
+app.use('/api/subscription', require('./routes/payment'));
+
 // Health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({ 
@@ -127,10 +131,14 @@ io.on('connection', (socket) => {
   });
 });
 
+// Start subscription cron jobs
+startCronJobs();
+
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`MongoDB URI: ${process.env.MONGODB_URI || 'mongodb://localhost:27017/marketing_dashboard'}`);
+  console.log('Subscription cron jobs started');
 });
 
 module.exports = app;

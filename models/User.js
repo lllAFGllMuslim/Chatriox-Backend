@@ -34,7 +34,7 @@ const userSchema = new mongoose.Schema({
   },
   plan: {
     type: String,
-    enum: ['starter', 'professional', 'enterprise'],
+    enum: ['starter', 'professional','business', 'enterprise'],
     default: 'starter'
   },
   planStatus: {
