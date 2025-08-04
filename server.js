@@ -138,7 +138,7 @@ server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`MongoDB URI: ${process.env.MONGODB_URI || 'mongodb://localhost:27017/marketing_dashboard'}`);
-  console.log('Subscription cron jobs started');
+  console.log('Subscriptions cron jobs started');
 });
 
 module.exports = app;
