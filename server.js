@@ -6,7 +6,6 @@ const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 const http = require('http');
 const socketIo = require('socket.io');
-const { startCronJobs } = require('./jobs/subscriptionCron');
 require('dotenv').config();
 
 const app = express();
@@ -16,6 +15,7 @@ const server = http.createServer(app);
 const corsOptions = {
   origin: [
     'http://localhost:3000',
+    'https://papakha.in',
     'http://localhost:5173',
     'http://127.0.0.1:5173',
     'http://localhost:8080'
@@ -61,7 +61,6 @@ app.use('/api/validation', require('./routes/validation'));
 app.use('/api/scraper', require('./routes/scraper'));
 app.use('/api/accounts', require('./routes/accounts'));
 app.use('/api/plans', require('./routes/plans'));
-app.use('/api/payments', require('./routes/payments'));
 app.use('/api/settings', require('./routes/settings'));
 app.use('/api/users', require('./routes/users'));
 app.use('/api/admin', require('./routes/admin'));
@@ -73,7 +72,7 @@ app.use('/api/email-tracking', require('./routes/email-tracking'));
 app.use('/api/whatsapp-web', require('./routes/whatsapp-web'));
 
 // New subscription routes with Cashfree integration
-app.use('/api/subscription', require('./routes/payment'));
+app.use('/api/subscription', require('./routes/payments'));
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
@@ -131,14 +130,11 @@ io.on('connection', (socket) => {
   });
 });
 
-// Start subscription cron jobs
-startCronJobs();
 
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`MongoDB URI: ${process.env.MONGODB_URI || 'mongodb://localhost:27017/marketing_dashboard'}`);
-  console.log('Subscriptions cron jobs started');
 });
 
 module.exports = app;

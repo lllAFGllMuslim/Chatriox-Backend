@@ -86,7 +86,6 @@ const PLANS = {
   }
 };
 
-// @route   POST /api/payments/create-order
 // @desc    Create payment order
 // @access  Private
 router.post('/create-order', [
@@ -120,14 +119,18 @@ router.post('/create-order', [
     const orderAmount = plan.price[billingCycle];
 
     const orderData = {
-      orderId,
-      orderAmount,
-      orderCurrency: 'INR',
-      customerName: user.name,
-      customerEmail: user.email,
-      customerPhone: user.phone || '9999999999',
-      returnUrl: `${process.env.FRONTEND_URL}/payment/success`,
-      notifyUrl: `${process.env.BACKEND_URL}/api/payments/webhook`
+      order_id: orderId,
+      order_amount: orderAmount,
+      order_currency: 'INR',
+      customer_details: {
+        customer_id: userId,
+        customer_name: user.name,
+        customer_email: user.email,
+        customer_phone: user.phone || '9999999999'
+      },
+      order_meta: {
+        return_url: `${process.env.FRONTEND_URL}/payment/success`
+      }
     };
 
     const result = await CashfreeService.createOrder(orderData);
@@ -159,82 +162,77 @@ router.post('/create-order', [
   }
 });
 
-// @route   POST /api/payments/webhook
-// @desc    Handle payment webhook
-// @access  Public
-router.post('/webhook', async (req, res) => {
+// @desc    Verify payment manually (call this after payment success)
+// @access  Private
+router.post('/verify-payment', [
+  auth,
+  body('orderId').notEmpty().withMessage('Order ID is required'),
+  body('planId').isIn(['starter', 'professional', 'enterprise']).withMessage('Invalid plan'),
+  body('billingCycle').isIn(['monthly', 'yearly']).withMessage('Invalid billing cycle')
+], async (req, res) => {
   try {
-    const {
-      orderId,
-      orderAmount,
-      referenceId,
-      txStatus,
-      paymentMode,
-      txMsg,
-      txTime,
-      signature
-    } = req.body;
-
-    // Verify signature
-    const isValidSignature = CashfreeService.verifySignature(
-      orderId,
-      orderAmount,
-      referenceId,
-      txStatus,
-      paymentMode,
-      txMsg,
-      txTime,
-      signature
-    );
-
-    if (!isValidSignature) {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid signature'
+        message: 'Validation failed',
+        errors: errors.array()
       });
     }
 
-    // Extract user ID from order ID
-    const userId = orderId.split('_')[2];
-    const user = await User.findById(userId);
+    const { orderId, planId, billingCycle } = req.body;
+    const userId = req.user.id;
 
-    if (!user) {
-      return res.status(404).json({
+    // Verify order status with Cashfree
+    const orderStatus = await CashfreeService.getOrderStatus(orderId);
+    
+    if (!orderStatus.success) {
+      return res.status(400).json({
         success: false,
-        message: 'User not found'
+        message: 'Failed to verify payment status'
       });
     }
 
-    if (txStatus === 'SUCCESS') {
-      // Extract plan info from order (you might want to store this in a separate orders table)
-      const orderInfo = await getOrderInfo(orderId); // Implement this function
+    if (orderStatus.data.order_status === 'PAID') {
+      const user = await User.findById(userId);
       
       // Update user plan
       user.planStatus = 'active';
-      user.plan = orderInfo.planId;
-      user.planExpiry = new Date(Date.now() + (orderInfo.billingCycle === 'yearly' ? 365 : 30) * 24 * 60 * 60 * 1000);
+      user.plan = planId;
+      user.planExpiry = new Date(Date.now() + (billingCycle === 'yearly' ? 365 : 30) * 24 * 60 * 60 * 1000);
       
       // Add payment to history
       user.paymentHistory.push({
         orderId,
-        paymentId: referenceId,
-        amount: orderAmount,
+        paymentId: orderStatus.data.cf_payment_id,
+        amount: orderStatus.data.order_amount,
         currency: 'INR',
         status: 'success',
-        plan: orderInfo.planId,
-        billingCycle: orderInfo.billingCycle,
+        plan: planId,
+        billingCycle: billingCycle,
         paidAt: new Date()
       });
 
       await user.save();
 
-      // Send confirmation email
-      // await sendPaymentConfirmationEmail(user, orderInfo);
+      res.json({
+        success: true,
+        message: 'Payment verified and plan activated',
+        data: {
+          plan: planId,
+          billingCycle,
+          planExpiry: user.planExpiry
+        }
+      });
+    } else {
+      res.status(400).json({
+        success: false,
+        message: 'Payment not completed',
+        status: orderStatus.data.order_status
+      });
     }
-
-    res.json({ success: true });
   } catch (error) {
-    console.error('Webhook error:', error);
+    console.error('Verify payment error:', error);
     res.status(500).json({
       success: false,
       message: 'Server error'
@@ -242,7 +240,6 @@ router.post('/webhook', async (req, res) => {
   }
 });
 
-// @route   GET /api/payments/plans
 // @desc    Get all plans with trial limits
 // @access  Private
 router.get('/plans', auth, async (req, res) => {
@@ -311,7 +308,6 @@ router.get('/trial-status', auth, async (req, res) => {
   }
 });
 
-// @route   POST /api/payments/extend-trial
 // @desc    Extend trial (admin only)
 // @access  Private/Admin
 router.post('/extend-trial', [auth], async (req, res) => {
@@ -352,14 +348,5 @@ router.post('/extend-trial', [auth], async (req, res) => {
     });
   }
 });
-
-// Helper function to get order info (implement based on your needs)
-async function getOrderInfo(orderId) {
-  // This is a simplified version - you might want to store order details in database
-  return {
-    planId: 'starter', // Extract from order or database
-    billingCycle: 'monthly' // Extract from order or database
-  };
-}
 
 module.exports = router;

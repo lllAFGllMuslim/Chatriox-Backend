@@ -3,56 +3,29 @@ const crypto = require('crypto');
 
 class CashfreeService {
   constructor() {
-    this.appId = process.env.CASHFREE_APP_ID;
-    this.secretKey = process.env.CASHFREE_SECRET_KEY;
-    this.environment = process.env.CASHFREE_ENV || 'TEST';
-    this.baseURL = this.environment === 'PROD' 
-      ? 'https://api.cashfree.com/pg' 
-      : 'https://sandbox.cashfree.com/pg';
-  }
-
-  // Generate signature for API authentication
-  generateSignature(postData) {
-    const signatureData = postData + this.secretKey;
-    return crypto.createHash('sha256').update(signatureData).digest('base64');
+    this.appId = process.env.CASHFREE_CLIENT_ID;
+    this.secretKey = process.env.CASHFREE_CLIENT_SECRET;
+    this.environment = 'PROD';
+    this.baseURL = 'https://api.cashfree.com/pg'
   }
 
   // Create payment order
   async createOrder(orderData) {
     try {
       const {
-        orderId,
-        orderAmount,
-        orderCurrency = 'INR',
-        customerName,
-        customerEmail,
-        customerPhone,
-        returnUrl,
-        notifyUrl
+        order_id,
+        order_amount,
+        order_currency = 'INR',
+        customer_details,
+        order_meta
       } = orderData;
 
-      const postData = JSON.stringify({
-        orderId,
-        orderAmount,
-        orderCurrency,
-        customerName,
-        customerEmail,
-        customerPhone,
-        returnUrl,
-        notifyUrl
-      });
-
-      const signature = this.generateSignature(postData);
-
       const response = await axios.post(`${this.baseURL}/orders`, {
-        orderId,
-        orderAmount,
-        orderCurrency,
-        customerName,
-        customerEmail,
-        customerPhone,
-        returnUrl,
-        notifyUrl
+        order_id,
+        order_amount,
+        order_currency,
+        customer_details,
+        order_meta
       }, {
         headers: {
           'Content-Type': 'application/json',
@@ -166,17 +139,6 @@ class CashfreeService {
         error: error.response?.data?.message || error.message
       };
     }
-  }
-
-  // Verify payment signature
-  verifySignature(orderId, orderAmount, referenceId, txStatus, paymentMode, txMsg, txTime, signature) {
-    const signatureData = `${orderId}${orderAmount}${referenceId}${txStatus}${paymentMode}${txMsg}${txTime}`;
-    const computedSignature = crypto
-      .createHmac('sha256', this.secretKey)
-      .update(signatureData)
-      .digest('base64');
-    
-    return computedSignature === signature;
   }
 }
 
