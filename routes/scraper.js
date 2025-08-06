@@ -1,733 +1,456 @@
 const express = require('express');
-const { body, validationResult } = require('express-validator');
+const rateLimit = require('express-rate-limit');
+const Job = require('../models/ScrapingJob');
 const { auth } = require('../middleware/auth');
-const ScrapingJob = require('../models/ScrapingJob');
-const User = require('../models/User');
-const cheerio = require('cheerio');
-const axios = require('axios');
-const puppeteer = require('puppeteer');
+const { EnhancedBusinessScraper } = require('../services/ScraperService');
 
 const router = express.Router();
 
-// @route   POST /api/scraper/start
-// @desc    Start scraping job
-// @access  Private
-router.post('/start', [
-  auth,
-  body('type').isIn(['website', 'business_search']).withMessage('Invalid scraping type'),
-  body('url').optional().isURL().withMessage('Valid URL is required for website scraping'),
-  body('searchQuery').optional().trim().isLength({ min: 1 }).withMessage('Search query is required for business search')
-], async (req, res) => {
+// Rate limiting specific to scraper routes
+const scraperLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // limit each IP to 10 requests per windowMs
+  message: 'Too many scraping requests from this IP, please try again later.'
+});
+
+// Global scraper instance
+const scraper = new EnhancedBusinessScraper();
+
+// Start scraping job
+router.post('/start', auth, scraperLimiter, async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        message: 'Validation failed',
-        errors: errors.array()
-      });
-    }
-
     const { type, url, searchQuery, location, settings } = req.body;
-    const userId = req.user.id;
-
-    // Validate required fields based on type
+    
+    // Validation
+    if (!type || !['website', 'business_search'].includes(type)) {
+      return res.status(400).json({ error: 'Invalid scraping type' });
+    }
+    
     if (type === 'website' && !url) {
-      return res.status(400).json({
-        success: false,
-        message: 'URL is required for website scraping'
-      });
+      return res.status(400).json({ error: 'URL is required for website scraping' });
+    }
+    
+    if (type === 'business_search' && (!searchQuery || !location)) {
+      return res.status(400).json({ error: 'Search query and location are required for business search' });
     }
 
-    if (type === 'business_search' && !searchQuery) {
-      return res.status(400).json({
-        success: false,
-        message: 'Search query is required for business search'
-      });
-    }
-
-    const scrapingJob = new ScrapingJob({
-      user: userId,
+    // Create job in database
+    const jobData = {
       type,
-      url: type === 'website' ? url : undefined,
-      searchQuery: type === 'business_search' ? searchQuery : undefined,
-      location: location || {},
-      settings: {
-        depth: settings?.depth || 1,
-        maxPages: settings?.maxPages || 50,
-        delay: settings?.delay || 2,
-        pattern: settings?.pattern || 'all',
-        maxResults: settings?.maxResults || 100
-      },
-      status: 'pending'
-    });
+      user: req.user.id,
+      settings: settings || {}
+    };
 
-    await scrapingJob.save();
+    if (type === 'website') {
+      jobData.url = url;
+    } else {
+      jobData.searchQuery = searchQuery;
+      jobData.location = location;
+    }
 
-    // Start scraping process (in a real implementation, this would be queued)
-    processScrapingJob(scrapingJob._id);
+    const job = new Job(jobData);
+    await job.save();
 
-    res.status(201).json({
+    console.log(`🚀 Starting scraping job ${job._id} for user ${req.user.id}`);
+
+    // Start scraping process asynchronously
+    processScrapeJob(job._id, type, { url, searchQuery, location }, settings || {});
+
+    res.json({
       success: true,
-      message: 'Scraping job started',
-      data: {
-        jobId: scrapingJob._id,
-        type: scrapingJob.type,
-        status: scrapingJob.status
-      }
+      jobId: job._id,
+      message: 'Scraping job started successfully'
     });
+
   } catch (error) {
-    console.error('Start scraping error:', error);
-    res.status(500).json({
+    console.error('❌ Error starting scraping job:', error);
+    res.status(500).json({ 
       success: false,
-      message: 'Server error'
+      error: 'Failed to start scraping job',
+      message: error.message 
     });
   }
 });
 
-// @route   GET /api/scraper/jobs
-// @desc    Get scraping jobs
-// @access  Private
+// Get all jobs for user
 router.get('/jobs', auth, async (req, res) => {
   try {
     const { page = 1, limit = 10, status } = req.query;
     
     const query = { user: req.user.id };
-    if (status) query.status = status;
-    
-    const jobs = await ScrapingJob.find(query)
+    if (status) {
+      query.status = status;
+    }
+
+    const jobs = await Job.find(query)
       .sort({ createdAt: -1 })
       .limit(limit * 1)
-      .skip((page - 1) * limit);
-    
-    const total = await ScrapingJob.countDocuments(query);
-    
+      .skip((page - 1) * limit)
+      .select('-results') // Exclude results for performance
+      .exec();
+
+    const total = await Job.countDocuments(query);
+
     res.json({
       success: true,
       data: jobs,
       pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total,
-        pages: Math.ceil(total / limit)
+        current: page,
+        pages: Math.ceil(total / limit),
+        total
       }
     });
+
   } catch (error) {
-    console.error('Get scraping jobs error:', error);
-    res.status(500).json({
+    console.error('❌ Error fetching jobs:', error);
+    res.status(500).json({ 
       success: false,
-      message: 'Server error'
+      error: 'Failed to fetch jobs',
+      message: error.message 
     });
   }
 });
 
-// @route   GET /api/scraper/jobs/:id
-// @desc    Get job details
-// @access  Private
-router.get('/jobs/:id', auth, async (req, res) => {
+// Get specific job details
+router.get('/jobs/:jobId', auth, async (req, res) => {
   try {
-    const job = await ScrapingJob.findOne({
-      _id: req.params.id,
+    const job = await Job.findOne({
+      _id: req.params.jobId,
       user: req.user.id
     });
-    
+
     if (!job) {
-      return res.status(404).json({
-        success: false,
-        message: 'Scraping job not found'
-      });
+      return res.status(404).json({ error: 'Job not found' });
     }
-    
+
     res.json({
       success: true,
       data: job
     });
+
   } catch (error) {
-    console.error('Get job details error:', error);
-    res.status(500).json({
+    console.error('❌ Error fetching job details:', error);
+    res.status(500).json({ 
       success: false,
-      message: 'Server error'
+      error: 'Failed to fetch job details',
+      message: error.message 
     });
   }
 });
 
-// @route   POST /api/scraper/jobs/:id/cancel
-// @desc    Cancel scraping job
-// @access  Private
-router.post('/jobs/:id/cancel', auth, async (req, res) => {
+// Cancel job
+router.post('/jobs/:jobId/cancel', auth, async (req, res) => {
   try {
-    const job = await ScrapingJob.findOne({
-      _id: req.params.id,
+    const job = await Job.findOne({
+      _id: req.params.jobId,
       user: req.user.id
     });
-    
+
     if (!job) {
-      return res.status(404).json({
-        success: false,
-        message: 'Scraping job not found'
-      });
+      return res.status(404).json({ error: 'Job not found' });
     }
-    
+
     if (job.status !== 'running' && job.status !== 'pending') {
-      return res.status(400).json({
-        success: false,
-        message: 'Job cannot be cancelled in current status'
-      });
+      return res.status(400).json({ error: 'Job cannot be cancelled' });
     }
-    
+
     job.status = 'cancelled';
+    job.progress.currentStatus = 'Cancelled by user';
     await job.save();
-    
+
+    console.log(`🛑 Job ${job._id} cancelled by user ${req.user.id}`);
+
     res.json({
       success: true,
-      message: 'Scraping job cancelled'
+      message: 'Job cancelled successfully'
     });
+
   } catch (error) {
-    console.error('Cancel job error:', error);
-    res.status(500).json({
+    console.error('❌ Error cancelling job:', error);
+    res.status(500).json({ 
       success: false,
-      message: 'Server error'
+      error: 'Failed to cancel job',
+      message: error.message 
     });
   }
 });
 
-// @route   GET /api/scraper/jobs/:id/results
-// @desc    Get scraping results
-// @access  Private
-router.get('/jobs/:id/results', auth, async (req, res) => {
+// Download job results as CSV
+router.get('/jobs/:jobId/results', auth, async (req, res) => {
   try {
-    const job = await ScrapingJob.findOne({
-      _id: req.params.id,
+    const job = await Job.findOne({
+      _id: req.params.jobId,
       user: req.user.id
     });
-    
+
     if (!job) {
-      return res.status(404).json({
-        success: false,
-        message: 'Scraping job not found'
-      });
+      return res.status(404).json({ error: 'Job not found' });
     }
-    
-    if (job.status !== 'completed') {
-      return res.status(400).json({
-        success: false,
-        message: 'Job is not completed yet'
-      });
+
+    if (job.status !== 'completed' || !job.results || job.results.length === 0) {
+      return res.status(400).json({ error: 'No results available for download' });
     }
-    
-    // Generate CSV content
-    const csvHeader = job.type === 'business_search' 
-      ? 'Business Name,Email,Phone,Website,Address,Source,Status\n'
-      : 'Email,Source,Domain,Status\n';
-    
-    const csvRows = job.results.map(result => {
-      if (job.type === 'business_search') {
-        return `"${result.businessName || ''}","${result.email}","${result.phone || ''}","${result.website || ''}","${result.address || ''}","${result.source}","${result.status}"`;
-      } else {
-        return `"${result.email}","${result.source}","${result.domain || ''}","${result.status}"`;
-      }
-    }).join('\n');
-    
-    const csvContent = csvHeader + csvRows;
-    
+
+    // Generate CSV
+    const csvHeaders = ['Email', 'Business Name', 'Phone', 'Address', 'Website', 'Rating', 'Source', 'Status'];
+    const csvRows = job.results.map(result => [
+      result.email || '',
+      result.businessName || '',
+      result.phone || '',
+      result.address || '',
+      result.website || '',
+      result.rating || '',
+      result.source || '',
+      result.status || ''
+    ]);
+
+    const csvContent = [csvHeaders, ...csvRows]
+      .map(row => row.map(cell => `"${cell.toString().replace(/"/g, '""')}"`).join(','))
+      .join('\n');
+
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', `attachment; filename="scraping_results_${job._id}.csv"`);
     res.send(csvContent);
+
   } catch (error) {
-    console.error('Get results error:', error);
-    res.status(500).json({
+    console.error('❌ Error downloading results:', error);
+    res.status(500).json({ 
       success: false,
-      message: 'Server error'
+      error: 'Failed to download results',
+      message: error.message 
     });
   }
 });
 
-// @route   GET /api/scraper/stats
-// @desc    Get scraping statistics
-// @access  Private
+// Get scraper statistics
 router.get('/stats', auth, async (req, res) => {
   try {
     const userId = req.user.id;
     
-    const totalJobs = await ScrapingJob.countDocuments({ user: userId });
-    const completedJobs = await ScrapingJob.countDocuments({ user: userId, status: 'completed' });
-    const runningJobs = await ScrapingJob.countDocuments({ user: userId, status: 'running' });
-    
-    // Get total emails found
-    const jobs = await ScrapingJob.find({ user: userId, status: 'completed' });
-    const totalEmailsFound = jobs.reduce((sum, job) => sum + (job.progress.emailsFound || 0), 0);
-    const totalValidEmails = jobs.reduce((sum, job) => sum + (job.progress.validEmails || 0), 0);
-    
+    const stats = await Job.aggregate([
+      { $match: { user: userId } },
+      {
+        $group: {
+          _id: null,
+          totalJobs: { $sum: 1 },
+          completedJobs: {
+            $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] }
+          },
+          runningJobs: {
+            $sum: { $cond: [{ $eq: ['$status', 'running'] }, 1, 0] }
+          },
+          totalEmails: { $sum: '$stats.withEmail' },
+          totalPhones: { $sum: '$stats.withPhone' },
+          totalBusinesses: { $sum: { $size: '$results' } }
+        }
+      }
+    ]);
+
+    const result = stats[0] || {
+      totalJobs: 0,
+      completedJobs: 0,
+      runningJobs: 0,
+      totalEmails: 0,
+      totalPhones: 0,
+      totalBusinesses: 0
+    };
+
     res.json({
       success: true,
-      data: {
-        totalJobs,
-        completedJobs,
-        runningJobs,
-        totalEmailsFound,
-        totalValidEmails,
-        successRate: totalJobs > 0 ? (completedJobs / totalJobs) * 100 : 0,
-        validationRate: totalEmailsFound > 0 ? (totalValidEmails / totalEmailsFound) * 100 : 0
-      }
+      stats: result
     });
+
   } catch (error) {
-    console.error('Get scraping stats error:', error);
-    res.status(500).json({
+    console.error('❌ Error fetching stats:', error);
+    res.status(500).json({ 
       success: false,
-      message: 'Server error'
+      error: 'Failed to fetch statistics',
+      message: error.message 
     });
   }
 });
 
-// Helper function to process scraping job
-async function processScrapingJob(jobId) {
+// Process scrape job asynchronously
+async function processScrapeJob(jobId, type, params, settings) {
+  let job;
+  
   try {
-    const job = await ScrapingJob.findById(jobId);
-    if (!job) return;
+    job = await Job.findById(jobId);
+    if (!job) {
+      console.error(`❌ Job ${jobId} not found`);
+      return;
+    }
 
+    // Update job status to running
     job.status = 'running';
-    job.startedAt = new Date();
+    job.progress.currentStatus = 'Starting scrape process...';
+    job.progress.percentage = 5;
     await job.save();
 
-    const results = [];
-    
-    if (job.type === 'website') {
-      // Real website scraping
-      await scrapeWebsite(job, results);
-    } else if (job.type === 'business_search') {
-      // Real business search scraping
-      await scrapeBusinessSearch(job, results);
-    }
+    const startTime = Date.now();
+    console.log(`🚀 Processing job ${jobId}: ${type}`);
 
-    // Complete the job
-    job.status = 'completed';
-    job.completedAt = new Date();
-    job.results = results;
-    await job.save();
+    let results = [];
 
-    // Update user usage
-    const user = await User.findById(job.user);
-    user.usage.websitesScraped = (user.usage.websitesScraped || 0) + 1;
-    await user.save();
+    if (type === 'website') {
+      // Website scraping
+      job.progress.currentStatus = 'Scraping website...';
+      job.progress.percentage = 20;
+      await job.save();
 
-  } catch (error) {
-    console.error('Process scraping job error:', error);
-    
-    // Mark job as failed
-    await ScrapingJob.findByIdAndUpdate(jobId, {
-      status: 'failed',
-      error: error.message,
-      completedAt: new Date()
-    });
-  }
-}
-
-// Real website scraping function
-async function scrapeWebsite(job, results) {
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
-  });
-  
-  try {
-    const page = await browser.newPage();
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
-    
-    const visitedUrls = new Set();
-    const urlsToVisit = [job.url];
-    let pagesScraped = 0;
-    
-    while (urlsToVisit.length > 0 && pagesScraped < job.settings.maxPages) {
-      const currentUrl = urlsToVisit.shift();
-      
-      if (visitedUrls.has(currentUrl)) continue;
-      visitedUrls.add(currentUrl);
-      
-      try {
-        console.log(`Scraping: ${currentUrl}`);
-        await page.goto(currentUrl, { waitUntil: 'networkidle2', timeout: 30000 });
-        
-        // Extract emails from page content
-        const pageEmails = await page.evaluate(() => {
-          const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g;
-          const text = document.body.innerText;
-          return text.match(emailRegex) || [];
+      const contactInfo = await scraper.scrapeContactFromWebsite(params.url);
+      if (contactInfo.email || contactInfo.phone) {
+        results.push({
+          email: contactInfo.email || '',
+          businessName: '',
+          phone: contactInfo.phone || '',
+          address: '',
+          website: params.url,
+          source: 'website_direct',
+          status: 'valid'
         });
+      }
+
+    } else {
+      // Business search
+      job.progress.currentStatus = 'Searching Google Maps...';
+      job.progress.percentage = 10;
+      await job.save();
+
+      // Launch parallel searches
+      const searchPromises = [
+        scraper.searchWithRetry(() => scraper.searchGoogleMaps(params.searchQuery, 
+          [params.location.city, params.location.state, params.location.country].filter(Boolean).join(', '))),
+        scraper.searchWithRetry(() => scraper.searchBusinessDirectory(params.searchQuery, 
+          [params.location.city, params.location.state, params.location.country].filter(Boolean).join(', '))),
+        scraper.searchWithRetry(() => scraper.searchYellowPages(params.searchQuery, 
+          [params.location.city, params.location.state, params.location.country].filter(Boolean).join(', ')))
+      ];
+
+      job.progress.currentStatus = 'Searching multiple sources...';
+      job.progress.percentage = 30;
+      await job.save();
+
+      const searchResults = await Promise.allSettled(searchPromises);
+      let businesses = [];
+      
+      searchResults.forEach((result, index) => {
+        if (result.status === 'fulfilled' && result.value.length > 0) {
+          businesses = businesses.concat(result.value);
+        }
+      });
+
+      job.progress.currentStatus = 'Deduplicating results...';
+      job.progress.percentage = 60;
+      await job.save();
+
+      // Deduplicate
+      const uniqueBusinesses = [];
+      const seen = new Set();
+      
+      businesses.forEach((business) => {
+        const nameKey = business.name.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const locationKey = business.address.toLowerCase().split(',')[0].replace(/[^a-z0-9]/g, '');
+        const uniqueKey = `${nameKey}-${locationKey}`;
         
-        // Extract phone numbers
-        const phoneNumbers = await page.evaluate(() => {
-          const phoneRegex = /(\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g;
-          const text = document.body.innerText;
-          return text.match(phoneRegex) || [];
-        });
-        
-        // Process found emails
-        for (const email of pageEmails) {
-          if (results.length >= job.settings.maxResults) break;
-          
-          const domain = email.split('@')[1];
-          const isValid = await validateEmailFormat(email);
-          
-          results.push({
-            email: email.toLowerCase(),
-            source: currentUrl,
-            domain,
-            status: isValid ? 'valid' : 'invalid',
-            foundAt: new Date()
+        if (!seen.has(uniqueKey)) {
+          seen.add(uniqueKey);
+          uniqueBusinesses.push({
+            email: business.email || '',
+            businessName: business.name || '',
+            phone: business.phone || '',
+            address: business.address || '',
+            website: business.website || '',
+            rating: business.rating || '',
+            source: business.source || 'unknown',
+            status: 'pending'
           });
         }
-        
-        // Extract more URLs to visit (if depth allows)
-        if (job.settings.depth > 1 && pagesScraped < job.settings.maxPages) {
-          const links = await page.evaluate(() => {
-            const links = Array.from(document.querySelectorAll('a[href]'));
-            return links.map(link => link.href).filter(href => 
-              href.startsWith('http') && 
-              !href.includes('#') && 
-              !href.includes('mailto:') &&
-              !href.includes('tel:')
-            );
-          });
+      });
+
+      job.progress.currentStatus = 'Enhancing with website data...';
+      job.progress.percentage = 80;
+      await job.save();
+
+      // Enhance top results
+      const enhanceCount = Math.min(settings.maxResults || 10, uniqueBusinesses.length);
+      for (let i = 0; i < enhanceCount; i++) {
+        try {
+          if (job.status === 'cancelled') break;
           
-          const baseUrl = new URL(currentUrl);
-          for (const link of links.slice(0, 10)) { // Limit links per page
-            try {
-              const linkUrl = new URL(link);
-              if (linkUrl.hostname === baseUrl.hostname && !visitedUrls.has(link)) {
-                urlsToVisit.push(link);
-              }
-            } catch (e) {
-              // Invalid URL, skip
-            }
+          const business = uniqueBusinesses[i];
+          if (!business.email || !business.phone) {
+            const enhanced = await scraper.enhanceWithWebsiteScraping({
+              name: business.businessName,
+              address: business.address,
+              website: business.website
+            });
+            
+            business.email = enhanced.email || business.email;
+            business.phone = enhanced.phone || business.phone;
+            business.website = enhanced.website || business.website;
           }
+          business.status = 'valid';
+        } catch (error) {
+          console.error(`❌ Enhancement failed for business ${i}:`, error.message);
         }
-        
-        pagesScraped++;
-        
-        // Update progress
-        job.progress.pagesScraped = pagesScraped;
-        job.progress.emailsFound = results.length;
-        job.progress.validEmails = results.filter(r => r.status === 'valid').length;
-        job.progress.percentage = Math.min((pagesScraped / job.settings.maxPages) * 100, 100);
-        await job.save();
-        
-        // Add delay between requests
-        await new Promise(resolve => setTimeout(resolve, job.settings.delay * 1000));
-        
-      } catch (pageError) {
-        console.error(`Error scraping ${currentUrl}:`, pageError);
-        continue;
       }
+
+      results = uniqueBusinesses.slice(0, settings.maxResults || 100);
     }
+
+    // Check if job was cancelled
+    const updatedJob = await Job.findById(jobId);
+    if (updatedJob.status === 'cancelled') {
+      console.log(`🛑 Job ${jobId} was cancelled during processing`);
+      return;
+    }
+
+    // Calculate statistics
+    const withEmail = results.filter(r => r.email).length;
+    const withPhone = results.filter(r => r.phone).length;
+    const withBoth = results.filter(r => r.email && r.phone).length;
+
+    // Update job with results
+    job.status = 'completed';
+    job.results = results;
+    job.progress.percentage = 100;
+    job.progress.currentStatus = 'Completed successfully';
+    job.progress.emailsFound = withEmail;
+    job.progress.phonesFound = withPhone;
+    job.progress.businessesFound = results.length;
+    job.stats = {
+      withEmail,
+      withPhone,
+      withBoth,
+      enhanced: type === 'business_search' ? Math.min(settings.maxResults || 10, results.length) : 0
+    };
+    job.sources = ['google_maps', 'bing_search', 'yellow_pages', 'website_enhancement'];
+    job.duration = `${((Date.now() - startTime) / 1000).toFixed(2)}s`;
+
+    await job.save();
+
+    console.log(`✅ Job ${jobId} completed successfully with ${results.length} results`);
+
+  } catch (error) {
+    console.error(`❌ Job ${jobId} failed:`, error.message);
     
-  } finally {
-    await browser.close();
+    if (job) {
+      job.status = 'failed';
+      job.errorMessage = error.message;
+      job.progress.currentStatus = 'Failed: ' + error.message;
+      await job.save();
+    }
   }
 }
 
-// Real business search scraping function
-async function scrapeBusinessSearch(job, results) {
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+// Health check
+router.get('/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    message: 'Enhanced Business Scraper API is running',
+    browserActive: scraper.browser !== null
   });
-  
-  try {
-    const page = await browser.newPage();
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
-    
-    // Search on multiple platforms
-    const searchPlatforms = [
-      {
-        name: 'Google Maps',
-        searchUrl: (query, location) => {
-          const locationStr = [location.city, location.state, location.country].filter(Boolean).join(', ');
-          return `https://www.google.com/maps/search/${encodeURIComponent(query + ' ' + locationStr)}`;
-        }
-      },
-      {
-        name: 'Yellow Pages',
-        searchUrl: (query, location) => {
-          const locationStr = [location.city, location.state].filter(Boolean).join(', ');
-          return `https://www.yellowpages.com/search?search_terms=${encodeURIComponent(query)}&geo_location_terms=${encodeURIComponent(locationStr)}`;
-        }
-      }
-    ];
-    
-    let totalBusinessesFound = 0;
-    
-    for (const platform of searchPlatforms) {
-      if (results.length >= job.settings.maxResults) break;
-      
-      try {
-        const searchUrl = platform.searchUrl(job.searchQuery, job.location);
-        console.log(`Searching on ${platform.name}: ${searchUrl}`);
-        
-        await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 30000 });
-        await page.waitForTimeout(3000); // Wait for dynamic content
-        
-        if (platform.name === 'Google Maps') {
-          await scrapeGoogleMaps(page, job, results);
-        } else if (platform.name === 'Yellow Pages') {
-          await scrapeYellowPages(page, job, results);
-        }
-        
-        // Update progress
-        job.progress.businessesFound = results.filter(r => r.businessName).length;
-        job.progress.emailsFound = results.length;
-        job.progress.validEmails = results.filter(r => r.status === 'valid').length;
-        job.progress.percentage = Math.min((results.length / job.settings.maxResults) * 100, 100);
-        await job.save();
-        
-        // Add delay between platforms
-        await new Promise(resolve => setTimeout(resolve, 5000));
-        
-      } catch (platformError) {
-        console.error(`Error scraping ${platform.name}:`, platformError);
-        continue;
-      }
-    }
-    
-  } finally {
-    await browser.close();
-  }
-}
-
-// Scrape Google Maps results
-async function scrapeGoogleMaps(page, job, results) {
-  try {
-    // Wait for results to load
-    await page.waitForSelector('[data-value="Search results"]', { timeout: 10000 });
-    
-    // Extract business information
-    const businesses = await page.evaluate(() => {
-      const businessElements = document.querySelectorAll('[data-result-index]');
-      const businesses = [];
-      
-      businessElements.forEach((element, index) => {
-        if (index >= 20) return; // Limit results
-        
-        const nameElement = element.querySelector('[class*="fontHeadlineSmall"]');
-        const addressElement = element.querySelector('[data-value="Address"]');
-        const phoneElement = element.querySelector('[data-value="Phone number"]');
-        const websiteElement = element.querySelector('[data-value="Website"]');
-        
-        if (nameElement) {
-          businesses.push({
-            name: nameElement.textContent?.trim(),
-            address: addressElement?.textContent?.trim(),
-            phone: phoneElement?.textContent?.trim(),
-            website: websiteElement?.href
-          });
-        }
-      });
-      
-      return businesses;
-    });
-    
-    // Process each business
-    for (const business of businesses) {
-      if (results.length >= job.settings.maxResults) break;
-      
-      // Try to find email from website
-      let email = null;
-      if (business.website) {
-        try {
-          email = await extractEmailFromWebsite(business.website);
-        } catch (e) {
-          console.log(`Could not extract email from ${business.website}`);
-        }
-      }
-      
-      // Generate potential email if not found
-      if (!email && business.name) {
-        email = generatePotentialEmail(business.name, business.website);
-      }
-      
-      if (email) {
-        const isValid = await validateEmailFormat(email);
-        results.push({
-          businessName: business.name,
-          email: email.toLowerCase(),
-          phone: business.phone,
-          website: business.website,
-          address: business.address,
-          source: 'Google Maps',
-          domain: email.split('@')[1],
-          status: isValid ? 'valid' : 'risky',
-          foundAt: new Date()
-        });
-      }
-    }
-  } catch (error) {
-    console.error('Error scraping Google Maps:', error);
-  }
-}
-
-// Scrape Yellow Pages results
-async function scrapeYellowPages(page, job, results) {
-  try {
-    // Wait for results
-    await page.waitForSelector('.result', { timeout: 10000 });
-    
-    const businesses = await page.evaluate(() => {
-      const businessElements = document.querySelectorAll('.result');
-      const businesses = [];
-      
-      businessElements.forEach((element, index) => {
-        if (index >= 20) return;
-        
-        const nameElement = element.querySelector('.business-name');
-        const addressElement = element.querySelector('.adr');
-        const phoneElement = element.querySelector('.phone');
-        const websiteElement = element.querySelector('.track-visit-website');
-        
-        if (nameElement) {
-          businesses.push({
-            name: nameElement.textContent?.trim(),
-            address: addressElement?.textContent?.trim(),
-            phone: phoneElement?.textContent?.trim(),
-            website: websiteElement?.href
-          });
-        }
-      });
-      
-      return businesses;
-    });
-    
-    // Process businesses similar to Google Maps
-    for (const business of businesses) {
-      if (results.length >= job.settings.maxResults) break;
-      
-      let email = null;
-      if (business.website) {
-        try {
-          email = await extractEmailFromWebsite(business.website);
-        } catch (e) {
-          console.log(`Could not extract email from ${business.website}`);
-        }
-      }
-      
-      if (!email && business.name) {
-        email = generatePotentialEmail(business.name, business.website);
-      }
-      
-      if (email) {
-        const isValid = await validateEmailFormat(email);
-        results.push({
-          businessName: business.name,
-          email: email.toLowerCase(),
-          phone: business.phone,
-          website: business.website,
-          address: business.address,
-          source: 'Yellow Pages',
-          domain: email.split('@')[1],
-          status: isValid ? 'valid' : 'risky',
-          foundAt: new Date()
-        });
-      }
-    }
-  } catch (error) {
-    console.error('Error scraping Yellow Pages:', error);
-  }
-}
-
-// Extract email from website
-async function extractEmailFromWebsite(websiteUrl) {
-  try {
-    const response = await axios.get(websiteUrl, {
-      timeout: 10000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
-    });
-    
-    const $ = cheerio.load(response.data);
-    const text = $('body').text();
-    
-    // Look for email patterns
-    const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g;
-    const emails = text.match(emailRegex);
-    
-    if (emails && emails.length > 0) {
-      // Filter out common non-business emails
-      const filteredEmails = emails.filter(email => {
-        const lowerEmail = email.toLowerCase();
-        return !lowerEmail.includes('noreply') && 
-               !lowerEmail.includes('no-reply') &&
-               !lowerEmail.includes('donotreply') &&
-               !lowerEmail.includes('example.com') &&
-               !lowerEmail.includes('test.com');
-      });
-      
-      // Prefer contact, info, or business emails
-      const preferredEmails = filteredEmails.filter(email => {
-        const lowerEmail = email.toLowerCase();
-        return lowerEmail.includes('contact') || 
-               lowerEmail.includes('info') || 
-               lowerEmail.includes('hello') ||
-               lowerEmail.includes('support');
-      });
-      
-      return preferredEmails.length > 0 ? preferredEmails[0] : filteredEmails[0];
-    }
-    
-    return null;
-  } catch (error) {
-    console.error('Error extracting email from website:', error);
-    return null;
-  }
-}
-
-// Generate potential email based on business name
-function generatePotentialEmail(businessName, website) {
-  if (!businessName) return null;
-  
-  let domain = null;
-  if (website) {
-    try {
-      domain = new URL(website).hostname.replace('www.', '');
-    } catch (e) {
-      // Invalid URL
-    }
-  }
-  
-  if (!domain) {
-    // Generate domain from business name
-    const cleanName = businessName.toLowerCase()
-      .replace(/[^a-z0-9\s]/g, '')
-      .replace(/\s+/g, '')
-      .substring(0, 20);
-    domain = `${cleanName}.com`;
-  }
-  
-  // Common email prefixes
-  const prefixes = ['info', 'contact', 'hello', 'admin', 'support'];
-  const randomPrefix = prefixes[Math.floor(Math.random() * prefixes.length)];
-  
-  return `${randomPrefix}@${domain}`;
-}
-
-// Validate email format
-async function validateEmailFormat(email) {
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  if (!emailRegex.test(email)) return false;
-  
-  // Additional checks
-  const domain = email.split('@')[1];
-  const disposableDomains = ['tempmail.org', '10minutemail.com', 'guerrillamail.com'];
-  
-  return !disposableDomains.includes(domain.toLowerCase());
-}
-
-// Add puppeteer to package.json dependencies
-async function ensurePuppeteerInstalled() {
-  try {
-    require('puppeteer');
-  } catch (error) {
-    console.log('Puppeteer not found. Please install it: npm install puppeteer');
-    throw new Error('Puppeteer is required for web scraping. Please install it.');
-  }
-}
+});
 
 module.exports = router;
