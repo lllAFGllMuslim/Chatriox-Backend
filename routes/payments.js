@@ -11,7 +11,7 @@ const router = express.Router();
 const PLANS = {
   starter: {
     name: 'Starter',
-    price: { monthly: 2465, yearly: 24650 }, // $29 * 85, $290 * 85
+    price: { monthly: 1, yearly: 24650 }, // $29 * 85, $290 * 85
     features: {
       emailsPerMonth: 5000,
       emailAccounts: 1,
@@ -61,7 +61,7 @@ const PLANS = {
   },
   enterprise: {
     name: 'Enterprise',
-    price: { monthly: 16915, yearly: 169150 }, // $199 * 85, $1990 * 85
+    price: { monthly: 1, yearly: 169150 }, // $199 * 85, $1990 * 85
     features: {
       emailsPerMonth: -1, // unlimited
       emailAccounts: -1, // unlimited
@@ -129,7 +129,7 @@ router.post('/create-order', [
         customer_phone: user.phone || '9999999999'
       },
       order_meta: {
-        return_url: `${process.env.FRONTEND_URL}/payment/success`
+        return_url: `${process.env.FRONTEND_URL}/payment/success?order_id=${orderId}&plan_id=${planId}&billing_cycle=${billingCycle}`
       }
     };
 
