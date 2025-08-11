@@ -44,6 +44,11 @@ const campaignSchema = new mongoose.Schema({
     fromName: String,
     fromEmail: String,
     replyTo: String,
+    smtpConfigId: { 
+      type: mongoose.Schema.Types.ObjectId, 
+      ref: 'SMTPConfig', 
+      required: true 
+    },
     trackOpens: { type: Boolean, default: true },
     trackClicks: { type: Boolean, default: true }
   },
@@ -54,7 +59,7 @@ const campaignSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ['draft', 'scheduled', 'sending', 'sent', 'completed', 'failed'],
+    enum: ['draft', 'pending', 'scheduled', 'sending', 'sent', 'completed', 'failed'],
     default: 'draft'
   },
   stats: {

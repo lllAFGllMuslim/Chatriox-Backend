@@ -61,7 +61,7 @@ const PLANS = {
   },
   enterprise: {
     name: 'Enterprise',
-    price: { monthly: 16915, yearly: 169150 }, // $199 * 85, $1990 * 85
+    price: { monthly: 1, yearly: 169150 }, // $199 * 85, $1990 * 85
     features: {
       emailsPerMonth: -1, // unlimited
       emailAccounts: -1, // unlimited
@@ -86,12 +86,59 @@ const PLANS = {
   }
 };
 
+
+const calculateUpgradePrice = (currentPlan, newPlan, billingCycle, daysUsed, currentBillingCycle) => {
+  const planHierarchy = { starter: 1, professional: 2, enterprise: 3 };
+  
+  // Allow billing cycle changes on same plan
+  const isHigherTier = planHierarchy[newPlan] > planHierarchy[currentPlan];
+  const isSamePlanBillingChange = currentPlan === newPlan && currentBillingCycle !== billingCycle;
+  
+  if (!isHigherTier && !isSamePlanBillingChange) {
+    return null; // Not an upgrade or billing change
+  }
+
+  // Don't allow yearly to monthly changes for now
+  if (currentBillingCycle === 'yearly' && billingCycle === 'monthly') {
+    return null;
+  }
+
+  const currentPlanConfig = PLANS[currentPlan];
+  const newPlanConfig = PLANS[newPlan];
+  
+  // Calculate total days in current billing cycle
+  const totalDaysInCycle = currentBillingCycle === 'yearly' ? 365 : 30;
+  const remainingDays = totalDaysInCycle - daysUsed;
+  
+  // Calculate daily rate of current plan
+  const currentPlanPrice = currentPlanConfig.price[currentBillingCycle];
+  const dailyRateCurrentPlan = currentPlanPrice / totalDaysInCycle;
+  
+  // Calculate credit for remaining days
+  const creditAmount = dailyRateCurrentPlan * remainingDays;
+  
+  // Calculate new plan price
+  const newPlanPrice = newPlanConfig.price[billingCycle];
+  
+  // Final discounted price
+  const discountedPrice = Math.max(0, newPlanPrice - creditAmount);
+  
+  return {
+    originalPrice: newPlanPrice,
+    creditAmount: Math.round(creditAmount * 100) / 100,
+    discountedPrice: Math.round(discountedPrice * 100) / 100,
+    remainingDays,
+    dailyRate: Math.round(dailyRateCurrentPlan * 100) / 100
+  };
+};
+
 // @desc    Create payment order
 // @access  Private
 router.post('/create-order', [
   auth,
   body('planId').isIn(['starter', 'professional', 'enterprise']).withMessage('Invalid plan'),
-  body('billingCycle').isIn(['monthly', 'yearly']).withMessage('Invalid billing cycle')
+  body('billingCycle').isIn(['monthly', 'yearly']).withMessage('Invalid billing cycle'),
+  body('isUpgrade').optional().isBoolean().withMessage('isUpgrade must be boolean')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -103,7 +150,7 @@ router.post('/create-order', [
       });
     }
 
-    const { planId, billingCycle } = req.body;
+    const { planId, billingCycle, isUpgrade = false } = req.body;
     const userId = req.user.id;
     const user = await User.findById(userId);
 
@@ -115,8 +162,38 @@ router.post('/create-order', [
       });
     }
 
+    let orderAmount = plan.price[billingCycle];
+    let upgradeInfo = null;
+
+    // Handle upgrade pricing (including billing cycle changes)
+    if (isUpgrade && user.planStatus === 'active') {
+      const currentDate = new Date();
+      const planStartDate = user.planExpiry ? 
+        new Date(user.planExpiry.getTime() - (user.currentBillingCycle === 'yearly' ? 365 : 30) * 24 * 60 * 60 * 1000) 
+        : user.createdAt;
+      
+      const daysUsed = Math.ceil((currentDate - planStartDate) / (1000 * 60 * 60 * 24));
+      
+      const upgrade = calculateUpgradePrice(
+        user.plan, 
+        planId, 
+        billingCycle, 
+        daysUsed, 
+        user.currentBillingCycle || 'monthly'
+      );
+      
+      if (!upgrade) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid upgrade. You can only upgrade to a higher tier plan or change billing cycles.'
+        });
+      }
+      
+      orderAmount = upgrade.discountedPrice;
+      upgradeInfo = upgrade;
+    }
+
     const orderId = `ORDER_${Date.now()}_${userId}`;
-    const orderAmount = plan.price[billingCycle];
 
     const orderData = {
       order_id: orderId,
@@ -129,7 +206,7 @@ router.post('/create-order', [
         customer_phone: user.phone || '9999999999'
       },
       order_meta: {
-        return_url: `${process.env.FRONTEND_URL}/payment/success`
+        return_url: `${process.env.FRONTEND_URL}/payment/success?order_id=${orderId}&plan_id=${planId}&billing_cycle=${billingCycle}&is_upgrade=${isUpgrade}`
       }
     };
 
@@ -142,8 +219,11 @@ router.post('/create-order', [
           orderId,
           paymentSessionId: result.data.payment_session_id,
           orderAmount,
+          originalAmount: plan.price[billingCycle],
           planId,
-          billingCycle
+          billingCycle,
+          isUpgrade,
+          upgradeInfo
         }
       });
     } else {
@@ -162,11 +242,9 @@ router.post('/create-order', [
   }
 });
 
-// @desc    Verify payment manually (call this after payment success)
-// @access  Private
-router.post('/verify-payment', [
+
+router.post('/calculate-upgrade', [
   auth,
-  body('orderId').notEmpty().withMessage('Order ID is required'),
   body('planId').isIn(['starter', 'professional', 'enterprise']).withMessage('Invalid plan'),
   body('billingCycle').isIn(['monthly', 'yearly']).withMessage('Invalid billing cycle')
 ], async (req, res) => {
@@ -180,7 +258,79 @@ router.post('/verify-payment', [
       });
     }
 
-    const { orderId, planId, billingCycle } = req.body;
+    const { planId, billingCycle } = req.body;
+    const userId = req.user.id;
+    const user = await User.findById(userId);
+
+    if (user.planStatus !== 'active') {
+      return res.status(400).json({
+        success: false,
+        message: 'No active plan found for upgrade calculation'
+      });
+    }
+
+    // Calculate days used in current plan
+    const currentDate = new Date();
+    const planStartDate = user.planExpiry ? 
+      new Date(user.planExpiry.getTime() - (user.currentBillingCycle === 'yearly' ? 365 : 30) * 24 * 60 * 60 * 1000) 
+      : user.createdAt;
+    
+    const daysUsed = Math.ceil((currentDate - planStartDate) / (1000 * 60 * 60 * 24));
+    
+    const upgrade = calculateUpgradePrice(
+      user.plan, 
+      planId, 
+      billingCycle, 
+      daysUsed, 
+      user.currentBillingCycle || 'monthly'
+    );
+    
+    if (!upgrade) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid upgrade. You can only upgrade to a higher tier plan or change billing cycles.'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        currentPlan: user.plan,
+        newPlan: planId,
+        billingCycle,
+        daysUsed,
+        ...upgrade
+      }
+    });
+  } catch (error) {
+    console.error('Calculate upgrade error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error'
+    });
+  }
+});
+
+// @desc    Verify payment manually (call this after payment success)
+// @access  Private
+router.post('/verify-payment', [
+  auth,
+  body('orderId').notEmpty().withMessage('Order ID is required'),
+  body('planId').isIn(['starter', 'professional', 'enterprise']).withMessage('Invalid plan'),
+  body('billingCycle').isIn(['monthly', 'yearly']).withMessage('Invalid billing cycle'),
+  body('isUpgrade').optional().isBoolean().withMessage('isUpgrade must be boolean') // Add this validation
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation failed',
+        errors: errors.array()
+      });
+    }
+
+    const { orderId, planId, billingCycle, isUpgrade = false } = req.body; // Extract isUpgrade
     const userId = req.user.id;
 
     // Verify order status with Cashfree
@@ -196,13 +346,27 @@ router.post('/verify-payment', [
     if (orderStatus.data.order_status === 'PAID') {
       const user = await User.findById(userId);
       
+      // Store previous plan info for upgrade handling
+      const previousPlan = user.plan;
+      const previousExpiry = user.planExpiry;
+      
       // Update user plan
       user.planStatus = 'active';
       user.plan = planId;
-      user.planExpiry = new Date(Date.now() + (billingCycle === 'yearly' ? 365 : 30) * 24 * 60 * 60 * 1000);
+      user.currentBillingCycle = billingCycle; // Add this field to track current billing cycle
       
-      // Add payment to history
-      user.paymentHistory.push({
+      // Handle plan expiry based on upgrade or new subscription
+      if (isUpgrade && previousExpiry && new Date() < previousExpiry) {
+        // For upgrades, extend from current expiry date instead of now
+        const daysToAdd = billingCycle === 'yearly' ? 365 : 30;
+        user.planExpiry = new Date(previousExpiry.getTime() + daysToAdd * 24 * 60 * 60 * 1000);
+      } else {
+        // For new subscriptions or expired plans
+        user.planExpiry = new Date(Date.now() + (billingCycle === 'yearly' ? 365 : 30) * 24 * 60 * 60 * 1000);
+      }
+      
+      // Add payment to history with upgrade info
+      const paymentRecord = {
         orderId,
         paymentId: orderStatus.data.cf_payment_id,
         amount: orderStatus.data.order_amount,
@@ -211,7 +375,14 @@ router.post('/verify-payment', [
         plan: planId,
         billingCycle: billingCycle,
         paidAt: new Date()
-      });
+      };
+      
+      if (isUpgrade) {
+        paymentRecord.isUpgrade = true;
+        paymentRecord.previousPlan = previousPlan;
+      }
+      
+      user.paymentHistory.push(paymentRecord);
 
       await user.save();
 
@@ -221,7 +392,8 @@ router.post('/verify-payment', [
         data: {
           plan: planId,
           billingCycle,
-          planExpiry: user.planExpiry
+          planExpiry: user.planExpiry,
+          wasUpgrade: isUpgrade
         }
       });
     } else {
@@ -239,6 +411,7 @@ router.post('/verify-payment', [
     });
   }
 });
+
 
 // @desc    Get all plans with trial limits
 // @access  Private
@@ -262,6 +435,7 @@ router.get('/plans', auth, async (req, res) => {
         currentUser: {
           plan: user.plan,
           planStatus: user.planStatus,
+          currentBillingCycle: user.currentBillingCycle || 'monthly', // Add this
           isInTrial,
           trialDaysRemaining,
           planExpiry: user.planExpiry

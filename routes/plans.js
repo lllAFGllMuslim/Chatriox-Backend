@@ -8,9 +8,9 @@ const router = express.Router();
 const PLANS = {
   starter: {
     name: 'Starter',
-    price: { monthly: 29, yearly: 290 },
+    price: { monthly: 0.01, yearly: 290 },
     features: {
-      emailsPerMonth: 5000,
+      emailsPerMonth: 4999,
       emailAccounts: 1,
       templates: 'basic',
       validation: true,
