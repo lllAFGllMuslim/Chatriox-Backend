@@ -10,326 +10,406 @@ const WhatsAppCampaign = require('../models/WhatsAppCampaign');
 const WhatsAppMessage = require('../models/WhatsAppMessage');
 const WhatsAppContactList = require('../models/WhatsAppContactList');
 const WhatsAppWebService = require('../services/WhatsAppWebService');
-const User = require('../models/User');
 
 const router = express.Router();
 
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadPath = path.join(__dirname, '../uploads/whatsapp');
-    if (!fs.existsSync(uploadPath)) {
-      fs.mkdirSync(uploadPath, { recursive: true });
+// Optimized file upload configuration
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      const uploadPath = path.join(__dirname, '../uploads/whatsapp');
+      if (!fs.existsSync(uploadPath)) fs.mkdirSync(uploadPath, { recursive: true });
+      cb(null, uploadPath);
+    },
+    filename: (req, file, cb) => {
+      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+      cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
     }
-    cb(null, uploadPath);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+  }),
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = /jpeg|jpg|png|gif|mp4|mov|avi|pdf|doc|docx|csv|txt|mp3|wav|ogg/;
+    const extname = allowed.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowed.test(file.mimetype);
+    cb(mimetype && extname ? null : new Error('Invalid file type'), mimetype && extname);
   }
 });
 
-const upload = multer({
-  storage,
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB limit
-  fileFilter: (req, file, cb) => {
-    const allowedTypes = /jpeg|jpg|png|gif|mp4|mov|avi|pdf|doc|docx|csv|txt|mp3|wav|ogg/;
-    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-    const mimetype = allowedTypes.test(file.mimetype);
-    
-    if (mimetype && extname) {
-      return cb(null, true);
-    } else {
-      cb(new Error('Invalid file type'));
-    }
+// Utility functions
+const handleError = (res, error, message = 'Server error') => {
+  console.error(`❌ ${message}:`, error);
+  res.status(500).json({ success: false, message, error: error.message });
+};
+
+const validatePhone = (phone) => {
+  if (!phone) return null;
+  const cleaned = phone.replace(/\D/g, '');
+  if (cleaned.length < 10) return null;
+  return cleaned.length === 10 ? '91' + cleaned : cleaned;
+};
+
+const parseJSON = (data) => {
+  try {
+    return typeof data === 'string' ? JSON.parse(data) : data;
+  } catch {
+    return null;
   }
-});
+};
 
 // @route   POST /api/whatsapp-web/connect
-// @desc    Connect WhatsApp account
-// @access  Private
+// @desc    Connect/Reconnect WhatsApp account
 router.post('/connect', [
   auth,
-  body('accountName').trim().isLength({ min: 1 }).withMessage('Account name is required'),
-  body('phoneNumber').optional().matches(/^\+?[\d\s\-\(\)]+$/).withMessage('Please enter a valid phone number')
+  body('accountName').trim().isLength({ min: 1 }).withMessage('Account name required'),
+  body('phoneNumber').optional().matches(/^\+?[\d\s\-\(\)]+$/).withMessage('Invalid phone number')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        message: 'Validation failed',
-        errors: errors.array()
-      });
+      return res.status(400).json({ success: false, errors: errors.array() });
     }
 
     const { accountName, phoneNumber } = req.body;
     const userId = req.user.id;
+    const io = req.app.get('io') || global.io;
 
-    console.log('Connect request:', { 
-      accountName, 
-      phoneNumber: phoneNumber || 'not provided', 
-      userId 
-    });
-
-    // Get user details
-    const user = await User.findById(userId);
-    
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'User not found'
-      });
+    if (!io) {
+      return res.status(500).json({ success: false, message: 'Socket.IO not available' });
     }
 
-    // Try to get phone number from request body or user profile (completely optional)
-    let finalPhoneNumber = phoneNumber || user.phone;
-    
-    // Clean and validate phone number only if provided
-    if (finalPhoneNumber) {
-      finalPhoneNumber = finalPhoneNumber.replace(/\D/g, ''); // Remove non-digits
-      
-      if (finalPhoneNumber.length < 10) {
+    // Check for existing account
+    let account = await WhatsAppAccount.findOne({ user: userId });
+
+    if (account) {
+      // Block if already active
+      if (['connecting', 'ready', 'authenticated'].includes(account.status)) {
         return res.status(400).json({
           success: false,
-          message: 'Please enter a valid phone number with at least 10 digits'
+          message: 'Account already active. Disconnect first to reconnect.',
+          data: { accountId: account._id, status: account.status }
         });
       }
 
-      // Add country code if not present
-      if (!finalPhoneNumber.startsWith('91') && finalPhoneNumber.length === 10) {
-        finalPhoneNumber = '91' + finalPhoneNumber;
+      // Reuse existing disconnected account
+      console.log(`🔄 Reusing existing account: ${account._id}`);
+      account.accountName = accountName;
+      account.status = 'connecting';
+      account.errorMessage = null;
+      if (phoneNumber) account.phoneNumber = validatePhone(phoneNumber);
+    } else {
+      // Create new account
+      const validatedPhone = validatePhone(phoneNumber);
+      if (phoneNumber && !validatedPhone) {
+        return res.status(400).json({ success: false, message: 'Invalid phone number' });
       }
 
-      // Check if account with this phone number already exists for this user
-      const existingAccount = await WhatsAppAccount.findOne({
+      account = new WhatsAppAccount({
         user: userId,
-        phoneNumber: finalPhoneNumber
+        accountName,
+        phoneNumber: validatedPhone,
+        status: 'connecting'
       });
-
-      if (existingAccount) {
-        return res.status(400).json({
-          success: false,
-          message: 'WhatsApp account with this phone number already exists',
-          data: {
-            accountId: existingAccount._id,
-            status: existingAccount.status
-          }
-        });
-      }
     }
-
-    // Create new WhatsApp account (phone number can be null initially)
-    const account = new WhatsAppAccount({
-      user: userId,
-      accountName,
-      phoneNumber: finalPhoneNumber || null, // Phone number is completely optional
-      status: 'connecting'
-    });
 
     await account.save();
-    console.log('Account created:', account._id);
 
-    // Initialize WhatsApp client with error handling
+    // Initialize WhatsApp client
     try {
-      // CRITICAL FIX: Get io instance from app or global
-      const io = req.app.get('io') || global.io;
-      
-      if (!io) {
-        console.error('Socket.IO instance not found!');
-        throw new Error('Socket.IO not available');
-      }
-
-      console.log('Initializing WhatsApp client with IO instance...');
-      
-      // Pass io instance to the service
       await WhatsAppWebService.initializeClient(account._id.toString(), userId, io);
       
-      res.status(201).json({
+      res.json({
         success: true,
-        message: finalPhoneNumber ? 
-          'WhatsApp account connection initiated. Please scan the QR code.' :
-          'WhatsApp account connection initiated. Phone number will be detected after QR scan.',
+        message: 'WhatsApp connection initiated. Scan QR code to proceed.',
         data: {
           accountId: account._id,
           accountName: account.accountName,
           phoneNumber: account.phoneNumber,
-          status: account.status
+          status: 'connecting'
         }
       });
     } catch (error) {
-      console.error('WhatsApp client initialization error:', error);
-      
-      // Safely update account status with error handling
-      try {
-        await WhatsAppAccount.findByIdAndUpdate(
-          account._id,
-          { 
-            status: 'failed',
-            errorMessage: error.message,
-            updatedAt: new Date()
-          },
-          { new: true }
-        );
-      } catch (updateError) {
-        console.error('Error updating account status:', updateError);
-      }
-      
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to initialize WhatsApp client',
-        error: error.message
-      });
+      account.status = 'failed';
+      account.errorMessage = error.message;
+      await account.save();
+      throw error;
     }
   } catch (error) {
-    console.error('Connect WhatsApp account error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to connect WhatsApp account',
-      error: error.message
-    });
+    handleError(res, error, 'WhatsApp connection failed');
   }
 });
 
-
-// @route   GET /api/whatsapp-web/accounts
-// @desc    Get all WhatsApp accounts for user
-// @access  Private
-router.get('/accounts', auth, async (req, res) => {
+// @route   POST /api/whatsapp-web/disconnect/:id
+// @desc    Disconnect WhatsApp account
+router.post('/disconnect/:id', auth, async (req, res) => {
   try {
-    const userId = req.user.id;
+    const account = await WhatsAppAccount.findOne({
+      _id: req.params.id,
+      user: req.user.id
+    });
+
+    if (!account) {
+      return res.status(404).json({ success: false, message: 'Account not found' });
+    }
+
+    await WhatsAppWebService.disconnectAccount(req.params.id);
     
-    const accounts = await WhatsAppAccount.find({ user: userId })
-      .sort({ createdAt: -1 })
-      .select('accountName phoneNumber status isActive lastSeen createdAt errorMessage');
-    
+    account.status = 'disconnected';
+    account.updatedAt = new Date();
+    await account.save();
+
     res.json({
       success: true,
-      data: accounts
+      message: 'Account disconnected successfully',
+      data: { accountId: account._id, status: 'disconnected' }
     });
   } catch (error) {
-    console.error('Get WhatsApp accounts error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error'
-    });
+    handleError(res, error, 'Disconnect failed');
   }
 });
 
 // @route   DELETE /api/whatsapp-web/accounts/:id
-// @desc    Delete WhatsApp account (NEW ROUTE)
-// @access  Private
+// @desc    Delete WhatsApp account permanently
 router.delete('/accounts/:id', auth, async (req, res) => {
   try {
-    const accountId = req.params.id;
-    const userId = req.user.id;
-
-    // Check if account exists and belongs to user
     const account = await WhatsAppAccount.findOne({
-      _id: accountId,
-      user: userId
+      _id: req.params.id,
+      user: req.user.id
     });
 
     if (!account) {
-      return res.status(404).json({
-        success: false,
-        message: 'WhatsApp account not found'
-      });
+      return res.status(404).json({ success: false, message: 'Account not found' });
     }
 
-    // Disconnect from WhatsApp Web service if connected
-    try {
-      await WhatsAppWebService.disconnectAccount(accountId);
-    } catch (error) {
-      console.error('Error disconnecting from WhatsApp service:', error);
-      // Continue with deletion even if disconnect fails
-    }
+    // Cleanup WhatsApp service
+    await WhatsAppWebService.disconnectAccount(req.params.id);
 
-    // Delete related campaigns and messages
-    await WhatsAppCampaign.deleteMany({ whatsappAccount: accountId });
-    await WhatsAppMessage.deleteMany({ whatsappAccount: accountId });
+    // Delete related data
+    await Promise.all([
+      WhatsAppCampaign.deleteMany({ whatsappAccount: req.params.id }),
+      WhatsAppMessage.deleteMany({ whatsappAccount: req.params.id }),
+      WhatsAppAccount.findByIdAndDelete(req.params.id)
+    ]);
 
-    // Delete the account
-    await WhatsAppAccount.findByIdAndDelete(accountId);
-
-    res.json({
-      success: true,
-      message: 'WhatsApp account deleted successfully'
-    });
+    res.json({ success: true, message: 'Account permanently deleted' });
   } catch (error) {
-    console.error('Delete WhatsApp account error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error',
-      error: error.message
-    });
+    handleError(res, error, 'Delete failed');
+  }
+});
+
+// @route   GET /api/whatsapp-web/accounts
+// @desc    Get user's WhatsApp accounts
+router.get('/accounts', auth, async (req, res) => {
+  try {
+    const accounts = await WhatsAppAccount.find({ user: req.user.id })
+      .sort({ createdAt: -1 })
+      .select('accountName phoneNumber status isActive lastActivity createdAt errorMessage');
+    
+    const enrichedAccounts = accounts.map(account => ({
+      ...account.toObject(),
+      canReconnect: ['disconnected', 'failed'].includes(account.status),
+      isConnected: ['ready', 'authenticated'].includes(account.status)
+    }));
+    
+    res.json({ success: true, data: enrichedAccounts });
+  } catch (error) {
+    handleError(res, error, 'Failed to fetch accounts');
   }
 });
 
 // @route   GET /api/whatsapp-web/account-status/:id
 // @desc    Get real-time account status
-// @access  Private
 router.get('/account-status/:id', auth, async (req, res) => {
   try {
-    const accountId = req.params.id;
-    const userId = req.user.id;
-
-    // Verify account ownership
     const account = await WhatsAppAccount.findOne({
-      _id: accountId,
-      user: userId
+      _id: req.params.id,
+      user: req.user.id
     });
 
     if (!account) {
-      return res.status(404).json({
-        success: false,
-        message: 'WhatsApp account not found'
-      });
+      return res.status(404).json({ success: false, message: 'Account not found' });
     }
 
     // Get real-time status from service
-    const serviceStatus = WhatsAppWebService.getAccountStatus(accountId);
+    const realTimeStatus = await WhatsAppWebService.getAccountStatus(req.params.id);
     
+    // Update database if status changed
+    if (realTimeStatus.status !== account.status) {
+      account.status = realTimeStatus.status;
+      if (realTimeStatus.status === 'disconnected') {
+        account.errorMessage = 'Connection lost';
+      }
+      await account.save();
+    }
+
     res.json({
       success: true,
       data: {
-        accountId,
-        dbStatus: account.status,
-        serviceStatus: serviceStatus.status,
-        phoneNumber: serviceStatus.phoneNumber,
-        profileName: serviceStatus.profileName,
+        accountId: req.params.id,
+        status: realTimeStatus.status,
+        phoneNumber: realTimeStatus.phoneNumber || account.phoneNumber,
+        profileName: realTimeStatus.profileName,
         lastActivity: account.lastActivity,
-        dailyMessageCount: account.dailyMessageCount,
-        dailyLimit: account.dailyLimit
+        errorMessage: account.errorMessage
       }
     });
   } catch (error) {
-    console.error('Get account status error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error'
+    handleError(res, error, 'Status check failed');
+  }
+});
+
+// @route   GET /api/whatsapp-web/qr/:id
+// @desc    Get QR code
+router.get('/qr/:id', auth, async (req, res) => {
+  try {
+    const account = await WhatsAppAccount.findOne({
+      _id: req.params.id,
+      user: req.user.id
     });
+
+    if (!account) {
+      return res.status(404).json({ success: false, message: 'Account not found' });
+    }
+
+    const qrCode = WhatsAppWebService.getQRCode(req.params.id);
+    
+    if (!qrCode) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'QR code not available. Try reconnecting.' 
+      });
+    }
+
+    res.json({ success: true, data: { qrCode, timestamp: new Date() } });
+  } catch (error) {
+    handleError(res, error, 'QR code fetch failed');
+  }
+});
+
+// @route   POST /api/whatsapp-web/send
+// @desc    Send WhatsApp messages
+router.post('/send', [auth, upload.single('media')], async (req, res) => {
+  try {
+    const { accountId, recipients, content, options = '{}' } = req.body;
+
+    // Validate inputs
+    if (!accountId?.match(/^[0-9a-fA-F]{24}$/)) {
+      return res.status(400).json({ success: false, message: 'Invalid account ID' });
+    }
+
+    const recipientList = parseJSON(recipients);
+    const messageContent = parseJSON(content);
+    const sendOptions = parseJSON(options);
+
+    if (!Array.isArray(recipientList) || recipientList.length === 0) {
+      return res.status(400).json({ success: false, message: 'Recipients required' });
+    }
+
+    if (!messageContent?.type || !['text', 'image', 'video'].includes(messageContent.type)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Valid content type required (text, image, video)' 
+      });
+    }
+
+    // Verify account
+    const account = await WhatsAppAccount.findOne({
+      _id: accountId,
+      user: req.user.id,
+      status: { $in: ['ready', 'authenticated'] }
+    });
+
+    if (!account) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Account not found or not ready' 
+      });
+    }
+
+    // Add media file info
+    if (req.file) {
+      messageContent.mediaPath = req.file.path;
+      messageContent.fileName = req.file.filename;
+      messageContent.mimeType = req.file.mimetype;
+    }
+
+    // Validate content requirements
+    if (messageContent.type === 'text' && !messageContent.text?.trim()) {
+      return res.status(400).json({ success: false, message: 'Text content required' });
+    }
+
+    if (messageContent.type !== 'text' && !req.file) {
+      return res.status(400).json({ success: false, message: 'Media file required' });
+    }
+
+    // Clean and validate phone numbers
+    const validRecipients = recipientList
+      .map(r => typeof r === 'string' ? r : r.phone)
+      .map(validatePhone)
+      .filter(Boolean);
+
+    if (validRecipients.length === 0) {
+      return res.status(400).json({ success: false, message: 'No valid phone numbers' });
+    }
+
+    // Create campaign
+    const campaign = new WhatsAppCampaign({
+      user: req.user.id,
+      name: `Bulk Send - ${new Date().toLocaleDateString()}`,
+      whatsappAccount: accountId,
+      messages: validRecipients.map(phone => ({
+        recipient: { phone },
+        content: messageContent,
+        status: 'pending'
+      })),
+      status: 'running',
+      antiBlockSettings: sendOptions
+    });
+
+    await campaign.save();
+
+    // Process campaign asynchronously
+    setImmediate(() => {
+      WhatsAppWebService.processCampaign(campaign._id)
+        .catch(async (error) => {
+          console.error('Campaign processing failed:', error);
+          await WhatsAppCampaign.findByIdAndUpdate(campaign._id, {
+            status: 'failed',
+            errorMessage: error.message,
+            completedAt: new Date()
+          });
+        });
+    });
+
+    res.json({
+      success: true,
+      message: 'Messages queued for sending',
+      data: {
+        campaignId: campaign._id,
+        recipientCount: validRecipients.length,
+        accountName: account.accountName
+      }
+    });
+  } catch (error) {
+    handleError(res, error, 'Send message failed');
   }
 });
 
 // @route   GET /api/whatsapp-web/campaigns
-// @desc    Get all campaigns for user
-// @access  Private
+// @desc    Get campaigns
 router.get('/campaigns', auth, async (req, res) => {
   try {
     const { page = 1, limit = 10, status } = req.query;
-    const userId = req.user.id;
-    
-    const query = { user: userId };
+    const query = { user: req.user.id };
     if (status) query.status = status;
     
-    const campaigns = await WhatsAppCampaign.find(query)
-      .populate('whatsappAccount', 'accountName phoneNumber')
-      .sort({ createdAt: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit);
-    
-    const total = await WhatsAppCampaign.countDocuments(query);
+    const [campaigns, total] = await Promise.all([
+      WhatsAppCampaign.find(query)
+        .populate('whatsappAccount', 'accountName phoneNumber')
+        .sort({ createdAt: -1 })
+        .limit(limit * 1)
+        .skip((page - 1) * limit),
+      WhatsAppCampaign.countDocuments(query)
+    ]);
     
     res.json({
       success: true,
@@ -342,569 +422,77 @@ router.get('/campaigns', auth, async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Get campaigns error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error'
-    });
-  }
-});
-
-// @route   GET /api/whatsapp-web/contacts/lists
-// @desc    Get all contact lists
-// @access  Private
-router.get('/contacts/lists', auth, async (req, res) => {
-  try {
-    const { page = 1, limit = 10, search } = req.query;
-    const userId = req.user.id;
-    
-    const query = { user: userId };
-    
-    // Add search functionality
-    if (search) {
-      query.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } }
-      ];
-    }
-    
-    const lists = await WhatsAppContactList.find(query)
-      .sort({ createdAt: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .select('name description contactCount createdAt updatedAt');
-    
-    const total = await WhatsAppContactList.countDocuments(query);
-    
-    res.json({
-      success: true,
-      data: lists,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total,
-        pages: Math.ceil(total / limit)
-      }
-    });
-  } catch (error) {
-    console.error('Get contact lists error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error',
-      error: error.message
-    });
+    handleError(res, error, 'Failed to fetch campaigns');
   }
 });
 
 // @route   POST /api/whatsapp-web/contacts/lists
-// @desc    Create new contact list
-// @access  Private
+// @desc    Create contact list
 router.post('/contacts/lists', [
   auth,
-  body('name').trim().isLength({ min: 1 }).withMessage('List name is required'),
-  body('description').optional().trim()
+  body('name').trim().isLength({ min: 1 }).withMessage('List name required')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        message: 'Validation failed',
-        errors: errors.array()
-      });
+      return res.status(400).json({ success: false, errors: errors.array() });
     }
 
     const { name, description, contacts = [] } = req.body;
-    const userId = req.user.id;
-
+    
     const contactList = new WhatsAppContactList({
-      user: userId,
+      user: req.user.id,
       name,
       description: description || '',
-      contacts: contacts,
+      contacts,
       contactCount: contacts.length
     });
 
     await contactList.save();
-
-    res.status(201).json({
-      success: true,
-      message: 'Contact list created successfully',
-      data: contactList
-    });
+    res.status(201).json({ success: true, message: 'Contact list created', data: contactList });
   } catch (error) {
-    console.error('Create contact list error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error',
-      error: error.message
-    });
+    handleError(res, error, 'Failed to create contact list');
   }
 });
 
-// @route   GET /api/whatsapp-web/contacts/lists/:id
-// @desc    Get specific contact list with contacts
-// @access  Private
-router.get('/contacts/lists/:id', auth, async (req, res) => {
-  try {
-    const listId = req.params.id;
-    const userId = req.user.id;
-    
-    const list = await WhatsAppContactList.findOne({
-      _id: listId,
-      user: userId
-    });
-    
-    if (!list) {
-      return res.status(404).json({
-        success: false,
-        message: 'Contact list not found'
-      });
-    }
-    
-    res.json({
-      success: true,
-      data: list
-    });
-  } catch (error) {
-    console.error('Get contact list error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error'
-    });
-  }
-});
-
-// @route   PUT /api/whatsapp-web/contacts/lists/:id
-// @desc    Update contact list
-// @access  Private
-router.put('/contacts/lists/:id', [
-  auth,
-  body('name').trim().isLength({ min: 1 }).withMessage('List name is required')
-], async (req, res) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        message: 'Validation failed',
-        errors: errors.array()
-      });
-    }
-    
-    const listId = req.params.id;
-    const userId = req.user.id;
-    const { name, description, contacts } = req.body;
-    
-    const updateData = { 
-      name, 
-      description, 
-      updatedAt: new Date() 
-    };
-    
-    if (contacts) {
-      updateData.contacts = contacts;
-      updateData.contactCount = contacts.length;
-    }
-    
-    const list = await WhatsAppContactList.findOneAndUpdate(
-      { _id: listId, user: userId },
-      updateData,
-      { new: true }
-    );
-    
-    if (!list) {
-      return res.status(404).json({
-        success: false,
-        message: 'Contact list not found'
-      });
-    }
-    
-    res.json({
-      success: true,
-      message: 'Contact list updated successfully',
-      data: list
-    });
-  } catch (error) {
-    console.error('Update contact list error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error'
-    });
-  }
-});
-
-// @route   DELETE /api/whatsapp-web/contacts/lists/:id
-// @desc    Delete contact list
-// @access  Private
-router.delete('/contacts/lists/:id', auth, async (req, res) => {
-  try {
-    const listId = req.params.id;
-    const userId = req.user.id;
-    
-    const list = await WhatsAppContactList.findOneAndDelete({
-      _id: listId,
-      user: userId
-    });
-    
-    if (!list) {
-      return res.status(404).json({
-        success: false,
-        message: 'Contact list not found'
-      });
-    }
-    
-    res.json({
-      success: true,
-      message: 'Contact list deleted successfully'
-    });
-  } catch (error) {
-    console.error('Delete contact list error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error'
-    });
-  }
-});
-
-// @route   POST /api/whatsapp-web/disconnect/:id
-// @desc    Disconnect WhatsApp account
-// @access  Private
-router.post('/disconnect/:id', auth, async (req, res) => {
-  try {
-    const accountId = req.params.id;
-    const userId = req.user.id;
-
-    const account = await WhatsAppAccount.findOne({
-      _id: accountId,
-      user: userId
-    });
-
-    if (!account) {
-      return res.status(404).json({
-        success: false,
-        message: 'WhatsApp account not found'
-      });
-    }
-
-    // Disconnect from WhatsApp Web
-    try {
-      await WhatsAppWebService.disconnectAccount(accountId);
-    } catch (error) {
-      console.error('Error disconnecting from WhatsApp service:', error);
-    }
-
-    // Update account status with error handling
-    try {
-      await WhatsAppAccount.findByIdAndUpdate(
-        accountId,
-        { 
-          status: 'disconnected',
-          updatedAt: new Date()
-        },
-        { new: true }
-      );
-    } catch (updateError) {
-      console.error('Error updating account status:', updateError);
-    }
-
-    res.json({
-      success: true,
-      message: 'WhatsApp account disconnected successfully'
-    });
-  } catch (error) {
-    console.error('Disconnect WhatsApp account error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error'
-    });
-  }
-});
-
-// @route   GET /api/whatsapp-web/qr/:id
-// @desc    Get QR code for account
-// @access  Private
-router.get('/qr/:id', auth, async (req, res) => {
-  try {
-    const accountId = req.params.id;
-    const userId = req.user.id;
-
-    // Verify account ownership
-    const account = await WhatsAppAccount.findOne({
-      _id: accountId,
-      user: userId
-    });
-
-    if (!account) {
-      return res.status(404).json({
-        success: false,
-        message: 'WhatsApp account not found'
-      });
-    }
-
-    const qrCode = WhatsAppWebService.getQRCode(accountId);
-
-    if (!qrCode) {
-      return res.status(404).json({
-        success: false,
-        message: 'QR code not available. Please try connecting again.'
-      });
-    }
-
-    res.json({
-      success: true,
-      data: {
-        qrCode,
-        timestamp: new Date()
-      }
-    });
-  } catch (error) {
-    console.error('Get QR code error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error'
-    });
-  }
-});
-
-// @route   POST /api/whatsapp-web/send
-// @desc    Send WhatsApp message
-// @access  Private
-router.post('/send', [
-  auth,
-  upload.single('media')
-], async (req, res) => {
-  try {
-    console.log('Request body:', req.body);
-    console.log('Request file:', req.file);
-
-    const { accountId, recipients, content, options = {} } = req.body;
-    const userId = req.user.id;
-
-    // Validate required fields
-    if (!accountId) {
-      return res.status(400).json({
-        success: false,
-        message: 'Account ID is required'
-      });
-    }
-
-    // Validate accountId format
-    if (!accountId.match(/^[0-9a-fA-F]{24}$/)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid account ID format'
-      });
-    }
-
-    // Parse and validate recipients
-    let recipientList;
-    try {
-      recipientList = typeof recipients === 'string' ? JSON.parse(recipients) : recipients;
-    } catch (error) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid recipients format. Must be valid JSON array.'
-      });
-    }
-
-    if (!Array.isArray(recipientList) || recipientList.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'At least one recipient is required'
-      });
-    }
-
-    // Parse and validate content
-    let messageContent;
-    try {
-      messageContent = typeof content === 'string' ? JSON.parse(content) : content;
-    } catch (error) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid content format. Must be valid JSON object.'
-      });
-    }
-
-    if (!messageContent || !messageContent.type) {
-      return res.status(400).json({
-        success: false,
-        message: 'Content type is required'
-      });
-    }
-
-    // Validate content type
-    const validContentTypes = ['text', 'image', 'video'];
-    if (!validContentTypes.includes(messageContent.type)) {
-      return res.status(400).json({
-        success: false,
-        message: `Invalid content type. Must be one of: ${validContentTypes.join(', ')}`
-      });
-    }
-
-    // Verify account ownership and status
-    const account = await WhatsAppAccount.findOne({
-      _id: accountId,
-      user: userId,
-      status: { $in: ['ready', 'connected', 'authenticated'] }
-    });
-
-    if (!account) {
-      return res.status(404).json({
-        success: false,
-        message: 'WhatsApp account not found or not ready. Please ensure your WhatsApp is connected.'
-      });
-    }
-
-    // Add media file path if uploaded
-    if (req.file) {
-      messageContent.mediaPath = req.file.path;
-      messageContent.fileName = req.file.filename;
-      messageContent.mimeType = req.file.mimetype;
-    }
-
-    // Validate that media file exists for non-text content types
-    if (messageContent.type !== 'text' && !req.file) {
-      return res.status(400).json({
-        success: false,
-        message: `Media file is required for content type: ${messageContent.type}`
-      });
-    }
-    
-    // Validate text content for text messages
-    if (messageContent.type === 'text' && (!messageContent.text || messageContent.text.trim() === '')) {
-      return res.status(400).json({
-        success: false,
-        message: 'Text content is required for text messages'
-      });
-    }
-    
-    // Clean and validate phone numbers
-    const validatedRecipients = [];
-    for (const recipient of recipientList) {
-      const phone = typeof recipient === 'string' ? recipient : recipient.phone;
-      if (!phone) {
-        continue; // Skip invalid recipients
-      }
-      
-      // Clean phone number
-      const cleanPhone = phone.replace(/\D/g, '');
-      if (cleanPhone.length >= 10) {
-        validatedRecipients.push(cleanPhone);
-      }
-    }
-    
-    if (validatedRecipients.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'No valid phone numbers found in recipients list'
-      });
-    }
-
-    // Create campaign for bulk send
-    const campaign = new WhatsAppCampaign({
-      user: userId,
-      name: `Bulk Send - ${new Date().toLocaleDateString()}`,
-      whatsappAccount: accountId,
-      messages: validatedRecipients.map(phone => ({
-        recipient: { phone },
-        content: messageContent,
-        status: 'pending'
-      })),
-      status: 'running'
-    });
-
-    await campaign.save();
-
-    // Process campaign (this should be handled by a background job)
-    try {
-      // Process campaign asynchronously
-      setImmediate(() => {
-        WhatsAppWebService.processCampaign(campaign._id)
-          .catch(async (error) => {
-            console.error('Error processing campaign:', error);
-            try {
-              await WhatsAppCampaign.findByIdAndUpdate(campaign._id, {
-                status: 'failed',
-                errorMessage: error.message,
-                updatedAt: new Date()
-              });
-            } catch (updateError) {
-              console.error('Error updating campaign status:', updateError);
-            }
-          });
-      });
-    } catch (error) {
-      console.error('Error initiating campaign processing:', error);
-      campaign.status = 'failed';
-      campaign.errorMessage = error.message;
-      await campaign.save();
-    }
-
-    res.json({
-      success: true,
-      message: 'Messages queued for sending',
-      data: {
-        campaignId: campaign._id,
-        recipientCount: validatedRecipients.length,
-        accountName: account.accountName
-      }
-    });
-  } catch (error) {
-    console.error('Send WhatsApp message error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error',
-      error: error.message
-    });
-  }
-});
 // @route   POST /api/whatsapp-web/contacts/import
 // @desc    Import contacts from CSV
-// @access  Private
 router.post('/contacts/import', [auth, upload.single('csvFile')], async (req, res) => {
   try {
     if (!req.file) {
-      return res.status(400).json({
-        success: false,
-        message: 'CSV file is required'
-      });
+      return res.status(400).json({ success: false, message: 'CSV file required' });
     }
 
     const { listName, listDescription } = req.body;
-    const userId = req.user.id;
-
     const contacts = [];
     const errors = [];
     let lineNumber = 0;
 
-    // Parse CSV file
+    // Parse CSV
     await new Promise((resolve, reject) => {
       fs.createReadStream(req.file.path)
         .pipe(csv())
         .on('data', (row) => {
           lineNumber++;
+          const phone = row.phone || row.Phone || row.number;
+          const validatedPhone = validatePhone(phone);
           
-          // Validate phone number
-          const phone = row.phone || row.Phone || row.PHONE || row.number;
-          if (!phone || !/^\+?[\d\s\-\(\)]+$/.test(phone)) {
-            errors.push(`Line ${lineNumber}: Invalid or missing phone number`);
+          if (!validatedPhone) {
+            errors.push(`Line ${lineNumber}: Invalid phone number`);
             return;
           }
 
           contacts.push({
-            phone: phone.replace(/\D/g, ''), // Remove non-digits
-            name: row.name || row.Name || row.NAME || '',
-            email: row.email || row.Email || row.EMAIL || '',
-            company: row.company || row.Company || row.COMPANY || '',
-            customFields: {
-              ...Object.keys(row).reduce((acc, key) => {
-                if (!['phone', 'name', 'email', 'company'].includes(key.toLowerCase())) {
-                  acc[key] = row[key];
-                }
-                return acc;
-              }, {})
-            },
+            phone: validatedPhone,
+            name: row.name || row.Name || '',
+            email: row.email || row.Email || '',
+            company: row.company || row.Company || '',
+            customFields: Object.keys(row).reduce((acc, key) => {
+              if (!['phone', 'name', 'email', 'company'].includes(key.toLowerCase())) {
+                acc[key] = row[key];
+              }
+              return acc;
+            }, {}),
             source: 'import'
           });
         })
@@ -912,21 +500,21 @@ router.post('/contacts/import', [auth, upload.single('csvFile')], async (req, re
         .on('error', reject);
     });
 
-    // Clean up uploaded file
+    // Clean up file
     fs.unlinkSync(req.file.path);
 
     if (contacts.length === 0) {
       return res.status(400).json({
         success: false,
-        message: 'No valid contacts found in CSV file',
+        message: 'No valid contacts found',
         errors
       });
     }
 
     // Create contact list
     const contactList = new WhatsAppContactList({
-      user: userId,
-      name: listName || `Imported List ${new Date().toLocaleDateString()}`,
+      user: req.user.id,
+      name: listName || `Imported - ${new Date().toLocaleDateString()}`,
       description: listDescription || 'Imported from CSV',
       contacts,
       contactCount: contacts.length
@@ -936,34 +524,23 @@ router.post('/contacts/import', [auth, upload.single('csvFile')], async (req, re
 
     res.json({
       success: true,
-      message: `${contacts.length} contacts imported successfully`,
+      message: `${contacts.length} contacts imported`,
       data: {
         listId: contactList._id,
         imported: contacts.length,
-        errors: errors.length,
-        details: {
-          importErrors: errors
-        }
+        errors: errors.length
       }
     });
   } catch (error) {
-    console.error('Import contacts error:', error);
-    
-    // Clean up file if it exists
     if (req.file && fs.existsSync(req.file.path)) {
       fs.unlinkSync(req.file.path);
     }
-    
-    res.status(500).json({
-      success: false,
-      message: 'Server error during import'
-    });
+    handleError(res, error, 'Import failed');
   }
 });
 
 // @route   GET /api/whatsapp-web/messages
 // @desc    Get message history
-// @access  Private
 router.get('/messages', auth, async (req, res) => {
   try {
     const { 
@@ -971,7 +548,6 @@ router.get('/messages', auth, async (req, res) => {
       limit = 50, 
       status, 
       accountId, 
-      recipient,
       campaignId,
       dateFrom,
       dateTo 
@@ -979,27 +555,25 @@ router.get('/messages', auth, async (req, res) => {
     
     const query = { user: req.user.id };
     
-    // Apply filters
     if (status) query.status = status;
     if (accountId) query.whatsappAccount = accountId;
     if (campaignId) query.campaign = campaignId;
-    if (recipient) query['recipient.phone'] = { $regex: recipient, $options: 'i' };
     
-    // Date range filter
     if (dateFrom || dateTo) {
       query.createdAt = {};
       if (dateFrom) query.createdAt.$gte = new Date(dateFrom);
       if (dateTo) query.createdAt.$lte = new Date(dateTo);
     }
     
-    const messages = await WhatsAppMessage.find(query)
-      .populate('whatsappAccount', 'accountName phoneNumber')
-      .populate('campaign', 'name')
-      .sort({ createdAt: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit);
-    
-    const total = await WhatsAppMessage.countDocuments(query);
+    const [messages, total] = await Promise.all([
+      WhatsAppMessage.find(query)
+        .populate('whatsappAccount', 'accountName phoneNumber')
+        .populate('campaign', 'name')
+        .sort({ createdAt: -1 })
+        .limit(limit * 1)
+        .skip((page - 1) * limit),
+      WhatsAppMessage.countDocuments(query)
+    ]);
     
     res.json({
       success: true,
@@ -1012,17 +586,12 @@ router.get('/messages', auth, async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Get messages error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error'
-    });
+    handleError(res, error, 'Failed to fetch messages');
   }
 });
 
 // @route   GET /api/whatsapp-web/analytics
-// @desc    Get WhatsApp analytics
-// @access  Private
+// @desc    Get comprehensive analytics
 router.get('/analytics', auth, async (req, res) => {
   try {
     const { timeRange = '30d', accountId } = req.query;
@@ -1030,42 +599,62 @@ router.get('/analytics', auth, async (req, res) => {
     
     // Calculate date range
     const now = new Date();
-    let startDate;
-    
-    switch (timeRange) {
-      case '7d':
-        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-        break;
-      case '30d':
-        startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-        break;
-      case '90d':
-        startDate = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
-        break;
-      default:
-        startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-    }
+    const days = timeRange === '7d' ? 7 : timeRange === '90d' ? 90 : 30;
+    const startDate = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
 
-    const query = { 
+    const baseQuery = { 
       user: userId,
       createdAt: { $gte: startDate }
     };
     
-    if (accountId) {
-      query.whatsappAccount = accountId;
-    }
+    if (accountId) baseQuery.whatsappAccount = accountId;
 
-    // Get message statistics
-    const totalMessages = await WhatsAppMessage.countDocuments(query);
-    const sentMessages = await WhatsAppMessage.countDocuments({ ...query, status: { $in: ['sent', 'delivered', 'read'] } });
-    const deliveredMessages = await WhatsAppMessage.countDocuments({ ...query, status: { $in: ['delivered', 'read'] } });
-    const readMessages = await WhatsAppMessage.countDocuments({ ...query, status: 'read' });
-    const failedMessages = await WhatsAppMessage.countDocuments({ ...query, status: 'failed' });
+    // Parallel queries for better performance
+    const [
+      totalMessages,
+      sentMessages,
+      deliveredMessages,
+      readMessages,
+      failedMessages,
+      dailyStats,
+      topFailureReasons
+    ] = await Promise.all([
+      WhatsAppMessage.countDocuments(baseQuery),
+      WhatsAppMessage.countDocuments({ ...baseQuery, status: { $in: ['sent', 'delivered', 'read'] } }),
+      WhatsAppMessage.countDocuments({ ...baseQuery, status: { $in: ['delivered', 'read'] } }),
+      WhatsAppMessage.countDocuments({ ...baseQuery, status: 'read' }),
+      WhatsAppMessage.countDocuments({ ...baseQuery, status: 'failed' }),
+      
+      // Daily statistics
+      WhatsAppMessage.aggregate([
+        { $match: baseQuery },
+        {
+          $group: {
+            _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+            total: { $sum: 1 },
+            sent: { $sum: { $cond: [{ $in: ["$status", ["sent", "delivered", "read"]] }, 1, 0] } },
+            delivered: { $sum: { $cond: [{ $in: ["$status", ["delivered", "read"]] }, 1, 0] } },
+            read: { $sum: { $cond: [{ $eq: ["$status", "read"] }, 1, 0] } },
+            failed: { $sum: { $cond: [{ $eq: ["$status", "failed"] }, 1, 0] } }
+          }
+        },
+        { $sort: { _id: 1 } }
+      ]),
+      
+      // Top failure reasons
+      WhatsAppMessage.aggregate([
+        { $match: { ...baseQuery, status: 'failed', failureReason: { $exists: true } } },
+        { $group: { _id: "$failureReason", count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+        { $limit: 5 }
+      ])
+    ]);
 
     // Calculate rates
-    const deliveryRate = sentMessages > 0 ? (deliveredMessages / sentMessages) * 100 : 0;
-    const readRate = deliveredMessages > 0 ? (readMessages / deliveredMessages) * 100 : 0;
-    const failureRate = totalMessages > 0 ? (failedMessages / totalMessages) * 100 : 0;
+    const deliveryRate = sentMessages > 0 ? ((deliveredMessages / sentMessages) * 100) : 0;
+    const readRate = deliveredMessages > 0 ? ((readMessages / deliveredMessages) * 100) : 0;
+    const failureRate = totalMessages > 0 ? ((failedMessages / totalMessages) * 100) : 0;
+    const successRate = totalMessages > 0 ? (((totalMessages - failedMessages) / totalMessages) * 100) : 0;
 
     res.json({
       success: true,
@@ -1078,16 +667,33 @@ router.get('/analytics', auth, async (req, res) => {
           failedMessages,
           deliveryRate: parseFloat(deliveryRate.toFixed(2)),
           readRate: parseFloat(readRate.toFixed(2)),
-          failureRate: parseFloat(failureRate.toFixed(2))
+          failureRate: parseFloat(failureRate.toFixed(2)),
+          successRate: parseFloat(successRate.toFixed(2))
+        },
+        dailyStats: dailyStats.map(stat => ({
+          date: stat._id,
+          total: stat.total,
+          sent: stat.sent,
+          delivered: stat.delivered,
+          read: stat.read,
+          failed: stat.failed,
+          deliveryRate: stat.sent > 0 ? parseFloat(((stat.delivered / stat.sent) * 100).toFixed(2)) : 0,
+          readRate: stat.delivered > 0 ? parseFloat(((stat.read / stat.delivered) * 100).toFixed(2)) : 0
+        })),
+        failureReasons: topFailureReasons.map(reason => ({
+          reason: reason._id,
+          count: reason.count,
+          percentage: parseFloat(((reason.count / failedMessages) * 100).toFixed(2))
+        })),
+        timeRange: {
+          start: startDate,
+          end: now,
+          days
         }
       }
     });
   } catch (error) {
-    console.error('Get WhatsApp analytics error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error'
-    });
+    handleError(res, error, 'Analytics fetch failed');
   }
 });
 

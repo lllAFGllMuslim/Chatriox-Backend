@@ -309,36 +309,24 @@ router.get('/track-open/:activityId', async (req, res) => {
     const { activityId } = req.params;
     
     const activity = await EmailActivity.findById(activityId);
-    if (activity && activity.status === 'sent') {
-      if (!activity.tracking.openedAt) {
-        activity.status = 'opened';
-        activity.tracking.openedAt = new Date();
-        
-        await Campaign.findByIdAndUpdate(activity.campaign, {
-          $inc: { 'stats.opened': 1 }
-        });
-      }
-      
-      activity.tracking.opens = (activity.tracking.opens || 0) + 1;
+    if (activity) {
+      activity.status = 'opened';
+      activity.tracking.openedAt = new Date();
+      activity.tracking.opens += 1;
       activity.tracking.userAgent = req.get('User-Agent');
       activity.tracking.ipAddress = req.ip;
       await activity.save();
     }
     
-    const pixel = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
-    res.set({
-      'Content-Type': 'image/png',
-      'Cache-Control': 'no-cache, no-store, must-revalidate'
-    });
+    // Return 1x1 transparent pixel
+    const pixel = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+    res.set('Content-Type', 'image/gif');
     res.send(pixel);
   } catch (error) {
     console.error('Track open error:', error);
-    const pixel = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
-    res.set('Content-Type', 'image/png');
-    res.send(pixel);
+    res.status(200).send('');
   }
 });
-
 
 // @route   GET /api/email-tracking/track-click/:activityId
 // @desc    Track email click
@@ -347,30 +335,19 @@ router.get('/track-click/:activityId', async (req, res) => {
   try {
     const { activityId } = req.params;
     const { url } = req.query;
-    const decodedUrl = decodeURIComponent(url || '');
     
     const activity = await EmailActivity.findById(activityId);
     if (activity) {
-      if (!activity.tracking.clickedAt) {
-        activity.status = 'clicked';
-        activity.tracking.clickedAt = new Date();
-        
-        await Campaign.findByIdAndUpdate(activity.campaign, {
-          $inc: { 'stats.clicked': 1 }
-        });
-      }
-      
-      activity.tracking.clicks = (activity.tracking.clicks || 0) + 1;
+      activity.status = 'clicked';
+      activity.tracking.clickedAt = new Date();
+      activity.tracking.clicks += 1;
       activity.tracking.userAgent = req.get('User-Agent');
       activity.tracking.ipAddress = req.ip;
       await activity.save();
     }
     
-    if (decodedUrl && decodedUrl.startsWith('http')) {
-      res.redirect(decodedUrl);
-    } else {
-      res.redirect('https://example.com');
-    }
+    // Redirect to original URL
+    res.redirect(url || 'https://example.com');
   } catch (error) {
     console.error('Track click error:', error);
     res.redirect('https://example.com');

@@ -56,7 +56,6 @@ app.use('/api/auth', require('./routes/auth'));
 app.use('/api/dashboard', require('./routes/dashboard'));
 app.use('/api/email', require('./routes/email'));
 app.use('/api/gmail', require('./routes/gmail'));
-app.use('/api/whatsapp', require('./routes/whatsapp'));
 app.use('/api/validation', require('./routes/validation'));
 app.use('/api/scraper', require('./routes/scraper'));
 app.use('/api/accounts', require('./routes/accounts'));
@@ -70,8 +69,6 @@ app.use('/api/templates', require('./routes/templates'));
 app.use('/api/campaigns', require('./routes/campaigns'));
 app.use('/api/email-tracking', require('./routes/email-tracking'));
 app.use('/api/whatsapp-web', require('./routes/whatsapp-web'));
-
-// New subscription routes with Cashfree integration
 app.use('/api/subscription', require('./routes/payments'));
 
 // Health check endpoint
@@ -107,7 +104,7 @@ const PORT = process.env.PORT || 5000;
 const io = socketIo(server, {
   cors: {
     origin: process.env.NODE_ENV === 'production' 
-      ? ['https://yourdomain.com'] 
+      ? ['https://papakha.in'] 
       : ['http://localhost:3000', 'http://localhost:5173'],
     credentials: true
   }
