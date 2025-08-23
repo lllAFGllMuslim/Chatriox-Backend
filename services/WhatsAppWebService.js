@@ -24,102 +24,110 @@ class WhatsAppWebService {
   }
 
   // Enhanced client initialization with better error handling
-  async initializeClient(accountId, userId, io = null) {
-    const accountIdStr = accountId.toString();
-    
-    // Prevent multiple simultaneous initializations
-    if (this.initializingClients.has(accountIdStr)) {
-      throw new Error('Client initialization already in progress');
-    }
-    
-    this.initializingClients.add(accountIdStr);
-    
-    try {
-      console.log(`🔄 Initializing client for account: ${accountIdStr}`);
-
-      // Get account from database
-      const account = await WhatsAppAccount.findOne({ _id: accountIdStr, user: userId });
-      if (!account) {
-        throw new Error('Account not found in database');
-      }
-
-      // Force cleanup any existing client and session
-      await this.forceCleanupClient(accountIdStr);
-      
-      // Wait a bit after cleanup
-      await this.sleep(2000);
-
-      // Create new client with enhanced settings
-      const client = new Client({
-        authStrategy: new LocalAuth({
-          clientId: accountIdStr,
-          dataPath: this.sessionPath
-        }),
-        puppeteer: {
-          headless: true,
-          args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--single-process',
-            '--disable-gpu',
-            '--disable-web-security',
-            '--disable-features=VizDisplayCompositor',
-            '--memory-pressure-off',
-            '--disable-background-timer-throttling',
-            '--disable-backgrounding-occluded-windows',
-            '--disable-renderer-backgrounding'
-          ],
-          timeout: 60000 // 60 second timeout
-        },
-        // Add session restore timeout
-        restartOnAuthFail: true,
-        qrMaxRetries: 3
-      });
-
-      // Store client immediately
-      this.clients.set(accountIdStr, client);
-      this.connectionHealth.set(accountIdStr, { status: 'initializing', lastCheck: Date.now() });
-
-      // Setup event handlers with enhanced error handling
-      this.setupClientEvents(client, accountIdStr, userId, account, io);
-
-      // Initialize client with timeout
-      const initPromise = client.initialize();
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('Client initialization timeout')), 90000); // 90 seconds
-      });
-
-      await Promise.race([initPromise, timeoutPromise]);
-      
-      console.log(`✅ Client initialized successfully for account: ${accountIdStr}`);
-      return client;
-
-    } catch (error) {
-      console.error(`❌ Client initialization failed for ${accountIdStr}:`, error.message);
-      
-      // Cleanup on failure
-      await this.forceCleanupClient(accountIdStr);
-      
-      // Update database status
-      try {
-        await WhatsAppAccount.findByIdAndUpdate(accountIdStr, {
-          status: 'failed',
-          errorMessage: error.message,
-          updatedAt: new Date()
-        });
-      } catch (dbError) {
-        console.error('Database update failed:', dbError);
-      }
-
-      throw error;
-    } finally {
-      this.initializingClients.delete(accountIdStr);
-    }
+async initializeClient(accountId, userId, io = null) {
+  const accountIdStr = accountId.toString();
+  
+  // FIXED: Use per-account initialization tracking instead of global
+  const initKey = `${userId}_${accountIdStr}`;
+  if (this.initializingClients.has(initKey)) {
+    throw new Error('Client initialization already in progress for this account');
   }
+  
+  this.initializingClients.add(initKey);
+  
+  try {
+    console.log(`🔄 Initializing client for account: ${accountIdStr} (user: ${userId})`);
+
+    // Get account from database
+    const account = await WhatsAppAccount.findOne({ _id: accountIdStr, user: userId });
+    if (!account) {
+      throw new Error('Account not found in database');
+    }
+
+    // Force cleanup any existing client and session
+    await this.forceCleanupClient(accountIdStr);
+    
+    // Wait a bit after cleanup
+    await this.sleep(2000);
+
+    // FIXED: Create unique session path per account
+    const sessionId = `${userId}_${accountIdStr}`;
+    
+    // Create new client with enhanced settings
+    const client = new Client({
+      authStrategy: new LocalAuth({
+        clientId: sessionId, // FIXED: Unique client ID per user+account
+        dataPath: this.sessionPath
+      }),
+      puppeteer: {
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas',
+          '--no-first-run',
+          '--no-zygote',
+          '--single-process',
+          '--disable-gpu',
+          '--disable-web-security',
+          '--disable-features=VizDisplayCompositor',
+          '--memory-pressure-off',
+          '--disable-background-timer-throttling',
+          '--disable-backgrounding-occluded-windows',
+          '--disable-renderer-backgrounding',
+          `--user-data-dir=${path.join(this.sessionPath, sessionId)}` // FIXED: Unique data dir
+        ],
+        timeout: 60000
+      },
+      restartOnAuthFail: true,
+      qrMaxRetries: 3
+    });
+
+    // Store client immediately
+    this.clients.set(accountIdStr, client);
+    this.connectionHealth.set(accountIdStr, { 
+      status: 'initializing', 
+      lastCheck: Date.now(),
+      userId: userId // FIXED: Track user ID
+    });
+
+    // Setup event handlers with enhanced error handling
+    this.setupClientEvents(client, accountIdStr, userId, account, io);
+
+    // Initialize client with timeout
+    const initPromise = client.initialize();
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('Client initialization timeout')), 90000);
+    });
+
+    await Promise.race([initPromise, timeoutPromise]);
+    
+    console.log(`✅ Client initialized successfully for account: ${accountIdStr}`);
+    return client;
+
+  } catch (error) {
+    console.error(`❌ Client initialization failed for ${accountIdStr}:`, error.message);
+    
+    // Cleanup on failure
+    await this.forceCleanupClient(accountIdStr);
+    
+    // Update database status
+    try {
+      await WhatsAppAccount.findByIdAndUpdate(accountIdStr, {
+        status: 'failed',
+        errorMessage: error.message,
+        updatedAt: new Date()
+      });
+    } catch (dbError) {
+      console.error('Database update failed:', dbError);
+    }
+
+    throw error;
+  } finally {
+    this.initializingClients.delete(initKey);
+  }
+}
 
   setupClientEvents(client, accountIdStr, userId, account, io) {
     // Handle client errors first
@@ -339,23 +347,43 @@ class WhatsAppWebService {
 
   // Force cleanup with session deletion
   async forceCleanupClient(accountId) {
-    const accountIdStr = accountId.toString();
-    
-    await this.safeCleanupClient(accountIdStr);
-    
-    // Also remove session files
+  const accountIdStr = accountId.toString();
+  
+  await this.safeCleanupClient(accountIdStr);
+  
+  // FIXED: Remove session files more carefully for multiple accounts
+  try {
+    // First try the direct session path
     const sessionDir = path.join(this.sessionPath, `session-${accountIdStr}`);
     if (fs.existsSync(sessionDir)) {
-      try {
-        fs.rmSync(sessionDir, { recursive: true, force: true });
-        console.log(`🗑️ Removed session directory for ${accountIdStr}`);
-      } catch (error) {
-        console.error(`Failed to remove session ${accountIdStr}:`, error);
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+      console.log(`🗑️ Removed session directory: ${sessionDir}`);
+    }
+
+    // Also check for user_account format sessions
+    const sessionPattern = new RegExp(`.*_${accountIdStr}$`);
+    const sessionFiles = fs.readdirSync(this.sessionPath);
+    
+    for (const file of sessionFiles) {
+      if (sessionPattern.test(file)) {
+        const fullPath = path.join(this.sessionPath, file);
+        if (fs.existsSync(fullPath)) {
+          if (fs.lstatSync(fullPath).isDirectory()) {
+            fs.rmSync(fullPath, { recursive: true, force: true });
+          } else {
+            fs.unlinkSync(fullPath);
+          }
+          console.log(`🗑️ Removed session file/dir: ${fullPath}`);
+        }
       }
     }
-    
-    this.reconnectAttempts.delete(accountIdStr);
+  } catch (error) {
+    console.error(`Failed to remove session files for ${accountIdStr}:`, error);
   }
+  
+  this.reconnectAttempts.delete(accountIdStr);
+}
+
 
   // Enhanced message sending with connection validation
   async sendMessage(accountId, recipient, content, options = {}) {
@@ -656,63 +684,71 @@ async disconnectAccount(accountId, userId = null, io = null) {
       } catch (logoutError) {
         console.error(`❌ Logout failed for ${accountIdStr}:`, logoutError.message);
         
-        // If standard logout fails, try alternative method to remove from linked devices
-        if (logoutError.message.includes('timeout') || 
-            logoutError.message.includes('Protocol error') ||
-            logoutError.message.includes('Session closed')) {
-          
-          console.log(`🔄 Trying alternative logout method for ${accountIdStr}`);
+        // If standard logout fails, try comprehensive browser logout methods
+        if (client.pupPage && !client.pupPage.isClosed()) {
+          console.log(`🔄 Trying comprehensive browser logout for ${accountIdStr}`);
           try {
-            // Try to send logout command directly via browser context
-            if (client.pupPage && !client.pupPage.isClosed()) {
-              await Promise.race([
-                client.pupPage.evaluate(() => {
-                  // Try multiple logout methods in browser context
-                  try {
-                    // Method 1: Use Store.AppState if available
-                    if (window.Store && window.Store.AppState && window.Store.AppState.logout) {
-                      window.Store.AppState.logout();
-                      return true;
-                    }
-                    
-                    // Method 2: Try to find and click logout in menu
-                    const menuButton = document.querySelector('[data-testid="menu"]');
-                    if (menuButton) {
-                      menuButton.click();
-                      setTimeout(() => {
-                        const logoutButton = document.querySelector('[data-testid="mi-logout"]');
-                        if (logoutButton) {
-                          logoutButton.click();
-                        }
-                      }, 1000);
-                      return true;
-                    }
-                    
-                    // Method 3: Direct navigation to logout
-                    if (window.location) {
-                      window.location.href = 'https://web.whatsapp.com/logout';
-                      return true;
-                    }
-                    
-                    return false;
-                  } catch (e) {
-                    console.error('Browser logout failed:', e);
-                    return false;
-                  }
-                }),
-                new Promise((_, reject) => 
-                  setTimeout(() => reject(new Error('Alternative logout timeout')), 10000)
-                )
-              ]);
-              
-              loggedOut = true;
-              console.log(`✅ Alternative logout successful: ${accountIdStr}`);
-              
-              // Wait for logout to process
-              await this.sleep(3000);
+            // Method 1: Direct Store API logout
+            await client.pupPage.evaluate(() => {
+              if (window.Store && window.Store.AppState && window.Store.AppState.logout) {
+                window.Store.AppState.logout();
+                return true;
+              }
+              return false;
+            });
+            
+            await this.sleep(2000);
+            
+            // Method 2: Menu-based logout
+            try {
+              await client.pupPage.click('[data-testid="menu"]', { timeout: 5000 });
+              await this.sleep(1000);
+              await client.pupPage.click('[data-testid="mi-logout"]', { timeout: 5000 });
+              await this.sleep(2000);
+            } catch (menuError) {
+              console.log('Menu logout failed, trying direct navigation');
             }
+            
+            // Method 3: Direct navigation + storage clear
+            await client.pupPage.evaluate(() => {
+              // Clear all storage
+              localStorage.clear();
+              sessionStorage.clear();
+              
+              // Clear IndexedDB
+              if (window.indexedDB) {
+                window.indexedDB.databases().then(databases => {
+                  databases.forEach(db => {
+                    if (db.name.includes('whatsapp') || db.name.includes('wawc')) {
+                      window.indexedDB.deleteDatabase(db.name);
+                    }
+                  });
+                });
+              }
+              
+              // Force logout and redirect
+              if (window.Store && window.Store.Conn) {
+                window.Store.Conn.logout();
+              }
+              
+              if (window.Store && window.Store.Socket) {
+                window.Store.Socket.close();
+              }
+              
+              // Navigate to logout
+              window.location.href = 'https://web.whatsapp.com/logout';
+              
+              return true;
+            });
+            
+            loggedOut = true;
+            console.log(`✅ Browser logout successful: ${accountIdStr}`);
+            
+            // Wait for logout to process
+            await this.sleep(5000);
+            
           } catch (altLogoutError) {
-            console.error(`Alternative logout also failed: ${altLogoutError.message}`);
+            console.error(`Browser logout also failed: ${altLogoutError.message}`);
           }
         }
       }
@@ -727,7 +763,7 @@ async disconnectAccount(accountId, userId = null, io = null) {
       isConnected: false,
       phoneNumber: null,
       qrCode: null,
-      errorMessage: loggedOut ? 'Properly logged out from WhatsApp servers' : 'Disconnected locally (server logout may have failed)',
+      errorMessage: loggedOut ? 'Successfully logged out from WhatsApp servers and removed from linked devices' : 'Disconnected locally (server logout may have failed)',
       lastActivity: new Date(),
       updatedAt: new Date()
     });
@@ -770,7 +806,6 @@ async disconnectAccount(accountId, userId = null, io = null) {
     throw error;
   }
 }
-
   // Process campaign method remains mostly the same but with enhanced client checking
   async processCampaign(campaignId) {
     try {
