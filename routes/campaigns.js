@@ -12,18 +12,38 @@ const crypto = require('crypto');
 
 const router = express.Router();
 
-// Decryption function for SMTP passwords
+// FIXED: Consistent encryption/decryption configuration - same as SMTP config
 const algorithm = 'aes-256-cbc';
-const secretKey = process.env.ENCRYPTION_KEY || crypto.randomBytes(32);
 
+// CRITICAL FIX: Use the same key logic as SMTP config file
+if (!process.env.ENCRYPTION_KEY) {
+  console.error('❌ ENCRYPTION_KEY environment variable is not set!');
+  throw new Error('ENCRYPTION_KEY environment variable is required for password decryption');
+}
+
+const secretKey = Buffer.from(process.env.ENCRYPTION_KEY, 'hex'); // Must match SMTP config exactly
+
+// FIXED: Consistent decryption function - same as SMTP config
 function decrypt(text) {
-  const textParts = text.split(':');
-  const iv = Buffer.from(textParts.shift(), 'hex');
-  const encryptedText = textParts.join(':');
-  const decipher = crypto.createDecipher(algorithm, secretKey);
-  let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
-  decrypted += decipher.final('utf8');
-  return decrypted;
+  try {
+    if (!text || typeof text !== 'string') {
+      throw new Error('Invalid encrypted text format');
+    }
+
+    const [ivHex, encryptedText] = text.split(':');
+    if (!ivHex || !encryptedText) {
+      throw new Error('Invalid encrypted text format - missing IV or data');
+    }
+
+    const iv = Buffer.from(ivHex, 'hex');
+    const decipher = crypto.createDecipheriv(algorithm, secretKey, iv);
+    let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+  } catch (error) {
+    console.error('Decryption error:', error.message);
+    throw new Error(`Failed to decrypt SMTP password: ${error.message}`);
+  }
 }
 
 // @route   POST /api/campaigns/create
@@ -62,6 +82,8 @@ router.post('/create', [
 
     const userId = req.user.id;
 
+    console.log(`🚀 Creating campaign: ${name} for user: ${userId}`);
+
     // Validate SMTP configuration
     const smtpConfig = await SMTPConfig.findOne({
       _id: smtpConfigId,
@@ -77,10 +99,25 @@ router.post('/create', [
       });
     }
 
+    console.log(`✅ SMTP config found: ${smtpConfig.name}`);
+
+    // FIXED: Test decryption early to catch issues
+    try {
+      const testDecrypt = decrypt(smtpConfig.password);
+      console.log('✅ SMTP password decryption test successful');
+    } catch (decryptError) {
+      console.error('❌ SMTP password decryption test failed:', decryptError.message);
+      return res.status(400).json({
+        success: false,
+        message: 'SMTP password decryption failed. Please re-save your SMTP configuration.',
+        error: decryptError.message
+      });
+    }
+
     // Validate template
     let template;
     if (templateId.startsWith('system_')) {
-      // Handle system templates (you'd need to import the system templates here)
+      // Handle system templates
       const systemTemplates = require('./templates').systemTemplates;
       template = systemTemplates.find(t => t._id === templateId);
     } else {
@@ -96,6 +133,8 @@ router.post('/create', [
         message: 'Template not found'
       });
     }
+
+    console.log(`✅ Template found: ${template.name || template._id}`);
 
     // Validate contact list
     const contactList = await ContactList.findOne({
@@ -123,6 +162,8 @@ router.post('/create', [
       });
     }
 
+    console.log(`✅ Contact list found: ${contactList.name}, Valid contacts: ${validContacts.length}`);
+
     // Create campaign
     const campaign = new Campaign({
       user: userId,
@@ -132,7 +173,7 @@ router.post('/create', [
       content: template.content,
       recipients: validContacts.map(contact => ({
         email: contact.email,
-        name: `${contact.firstName} ${contact.lastName}`.trim(),
+        name: `${contact.firstName || ''} ${contact.lastName || ''}`.trim(),
         status: 'pending'
       })),
       settings: {
@@ -149,14 +190,28 @@ router.post('/create', [
         isScheduled: scheduleType === 'scheduled',
         scheduledAt: scheduleType === 'scheduled' ? new Date(scheduledAt) : null
       },
-      status: scheduleType === 'scheduled' ? 'scheduled' : 'pending'
+      status: scheduleType === 'scheduled' ? 'scheduled' : 'pending',
+      stats: {
+        sent: 0,
+        failed: 0,
+        pending: validContacts.length,
+        opened: 0,
+        clicked: 0,
+        bounced: 0,
+        unsubscribed: 0
+      }
     });
 
     await campaign.save();
+    console.log(`✅ Campaign created: ${campaign._id}`);
 
-    // If sending now, start processing
+    // If sending now, start processing with proper error handling
     if (scheduleType === 'now') {
-      processCampaign(campaign._id);
+      console.log(`🎯 Starting campaign processing immediately: ${campaign._id}`);
+      // Don't await this, but handle errors properly
+      processCampaign(campaign._id).catch(error => {
+        console.error(`❌ Campaign processing failed for ${campaign._id}:`, error);
+      });
     }
 
     res.status(201).json({
@@ -171,10 +226,11 @@ router.post('/create', [
       }
     });
   } catch (error) {
-    console.error('Create campaign error:', error);
+    console.error('❌ Create campaign error:', error);
     res.status(500).json({
       success: false,
-      message: 'Server error'
+      message: 'Server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
@@ -193,7 +249,7 @@ router.get('/', auth, async (req, res) => {
       .sort({ createdAt: -1 })
       .limit(limit * 1)
       .skip((page - 1) * limit)
-      .select('name subject status stats schedule createdAt sentAt completedAt');
+      .select('name subject status stats schedule createdAt sentAt completedAt error');
     
     const total = await Campaign.countDocuments(query);
     
@@ -208,7 +264,7 @@ router.get('/', auth, async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Get campaigns error:', error);
+    console.error('❌ Get campaigns error:', error);
     res.status(500).json({
       success: false,
       message: 'Server error'
@@ -238,7 +294,7 @@ router.get('/:id', auth, async (req, res) => {
       data: campaign
     });
   } catch (error) {
-    console.error('Get campaign error:', error);
+    console.error('❌ Get campaign error:', error);
     res.status(500).json({
       success: false,
       message: 'Server error'
@@ -271,6 +327,7 @@ router.post('/:id/cancel', auth, async (req, res) => {
     }
     
     campaign.status = 'cancelled';
+    campaign.completedAt = new Date();
     await campaign.save();
     
     res.json({
@@ -278,7 +335,7 @@ router.post('/:id/cancel', auth, async (req, res) => {
       message: 'Campaign cancelled successfully'
     });
   } catch (error) {
-    console.error('Cancel campaign error:', error);
+    console.error('❌ Cancel campaign error:', error);
     res.status(500).json({
       success: false,
       message: 'Server error'
@@ -317,7 +374,7 @@ router.delete('/:id', auth, async (req, res) => {
       message: 'Campaign deleted successfully'
     });
   } catch (error) {
-    console.error('Delete campaign error:', error);
+    console.error('❌ Delete campaign error:', error);
     res.status(500).json({
       success: false,
       message: 'Server error'
@@ -325,56 +382,252 @@ router.delete('/:id', auth, async (req, res) => {
   }
 });
 
-// Helper function to process campaign
-async function processCampaign(campaignId) {
+// @route   POST /api/campaigns/test-smtp/:configId
+// @desc    Test SMTP configuration
+// @access  Private
+router.post('/test-smtp/:configId', auth, async (req, res) => {
   try {
-    const campaign = await Campaign.findById(campaignId).populate('user');
-    if (!campaign) return;
+    console.log(`🧪 Testing SMTP config: ${req.params.configId}`);
+    
+    const smtpConfig = await SMTPConfig.findOne({
+      _id: req.params.configId,
+      user: req.user.id
+    });
 
-    // Get SMTP configuration
-    const smtpConfig = await SMTPConfig.findById(campaign.settings.smtpConfigId);
     if (!smtpConfig) {
-      campaign.status = 'failed';
-      campaign.error = 'SMTP configuration not found';
-      await campaign.save();
-      return;
+      return res.status(404).json({
+        success: false,
+        message: 'SMTP configuration not found'
+      });
     }
 
-    // Decrypt SMTP password
-    const decryptedPassword = decrypt(smtpConfig.password);
+    console.log(`📧 Testing SMTP: ${smtpConfig.host}:${smtpConfig.port}`);
 
-    // Create transporter
-    const transporter = nodemailer.createTransport({
+    // FIXED: Use consistent decryption
+    let decryptedPassword;
+    try {
+      decryptedPassword = decrypt(smtpConfig.password);
+      console.log('✅ Password decryption successful');
+    } catch (error) {
+      console.error('❌ Password decryption failed:', error);
+      return res.status(400).json({
+        success: false,
+        message: 'Failed to decrypt SMTP password. Please re-save your SMTP configuration.',
+        error: error.message
+      });
+    }
+
+    const transporterConfig = {
       host: smtpConfig.host,
-      port: smtpConfig.port,
+      port: parseInt(smtpConfig.port),
       secure: smtpConfig.secure,
       auth: {
         user: smtpConfig.username,
         pass: decryptedPassword
       }
-    });
+    };
 
-    // Update campaign status
+    const transporter = nodemailer.createTransport(transporterConfig);
+
+    // Verify connection
+    console.log('🔍 Verifying SMTP connection...');
+    await transporter.verify();
+    console.log('✅ SMTP verification successful');
+
+    // Send test email
+    const testEmail = {
+      from: `${smtpConfig.fromName} <${smtpConfig.fromEmail}>`,
+      to: smtpConfig.fromEmail, // Send to self for testing
+      subject: 'SMTP Test Email - ' + new Date().toLocaleString(),
+      html: `
+        <h2>🎉 SMTP Test Successful!</h2>
+        <p>Your SMTP configuration is working correctly.</p>
+        <p><strong>Config Details:</strong></p>
+        <ul>
+          <li>Host: ${smtpConfig.host}</li>
+          <li>Port: ${smtpConfig.port}</li>
+          <li>Secure: ${smtpConfig.secure}</li>
+          <li>From: ${smtpConfig.fromName} &lt;${smtpConfig.fromEmail}&gt;</li>
+        </ul>
+        <p>Test performed at: ${new Date().toISOString()}</p>
+      `
+    };
+
+    console.log('📤 Sending test email...');
+    const info = await transporter.sendMail(testEmail);
+    console.log('✅ Test email sent successfully:', info.messageId);
+
+    res.json({
+      success: true,
+      message: 'SMTP test successful - check your inbox!',
+      data: {
+        messageId: info.messageId,
+        config: {
+          host: smtpConfig.host,
+          port: smtpConfig.port,
+          secure: smtpConfig.secure,
+          from: `${smtpConfig.fromName} <${smtpConfig.fromEmail}>`
+        }
+      }
+    });
+  } catch (error) {
+    console.error('❌ SMTP test error:', error);
+    res.status(400).json({
+      success: false,
+      message: 'SMTP test failed',
+      error: error.message
+    });
+  }
+});
+
+// @route   POST /api/campaigns/debug/:id
+// @desc    Debug campaign processing
+// @access  Private
+router.post('/debug/:id', auth, async (req, res) => {
+  try {
+    const campaign = await Campaign.findOne({
+      _id: req.params.id,
+      user: req.user.id
+    });
+    
+    if (!campaign) {
+      return res.status(404).json({
+        success: false,
+        message: 'Campaign not found'
+      });
+    }
+    
+    console.log(`🐛 Debug campaign: ${campaign.name} (${campaign._id})`);
+    console.log(`📊 Status: ${campaign.status}`);
+    console.log(`📧 Recipients: ${campaign.recipients.length}`);
+    console.log(`⚙️ SMTP Config: ${campaign.settings.smtpConfigId}`);
+    
+    // Try to process manually
+    processCampaign(campaign._id).catch(error => {
+      console.error('❌ Manual processing failed:', error);
+    });
+    
+    res.json({ 
+      success: true, 
+      message: 'Manual processing started - check server logs',
+      data: {
+        campaignId: campaign._id,
+        status: campaign.status,
+        recipients: campaign.recipients.length,
+        error: campaign.error
+      }
+    });
+  } catch (error) {
+    console.error('❌ Debug error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Debug failed',
+      error: error.message 
+    });
+  }
+});
+
+// FIXED: Campaign processing function with consistent decryption
+async function processCampaign(campaignId) {
+  console.log(`\n🚀 ===== STARTING CAMPAIGN PROCESSING: ${campaignId} =====`);
+  
+  try {
+    // Get campaign
+    const campaign = await Campaign.findById(campaignId).populate('user');
+    if (!campaign) {
+      throw new Error(`Campaign not found: ${campaignId}`);
+    }
+
+    console.log(`📋 Campaign: "${campaign.name}"`);
+    console.log(`👤 User: ${campaign.user.email}`);
+    console.log(`📧 Recipients: ${campaign.recipients.length}`);
+
+    // Update status to sending
     campaign.status = 'sending';
     campaign.sentAt = new Date();
     await campaign.save();
+    console.log('✅ Campaign status updated to SENDING');
+
+    // Get SMTP configuration
+    const smtpConfig = await SMTPConfig.findById(campaign.settings.smtpConfigId);
+    if (!smtpConfig) {
+      throw new Error(`SMTP configuration not found: ${campaign.settings.smtpConfigId}`);
+    }
+
+    console.log(`📤 SMTP: ${smtpConfig.name} (${smtpConfig.host}:${smtpConfig.port})`);
+
+    // FIXED: Use consistent decryption
+    let decryptedPassword;
+    try {
+      decryptedPassword = decrypt(smtpConfig.password);
+      console.log('🔓 SMTP password decrypted successfully');
+    } catch (error) {
+      throw new Error(`Password decryption failed: ${error.message}`);
+    }
+
+    // Create transporter configuration
+    const transporterConfig = {
+      host: smtpConfig.host,
+      port: parseInt(smtpConfig.port),
+      secure: smtpConfig.secure,
+      auth: {
+        user: smtpConfig.username,
+        pass: decryptedPassword
+      },
+      // Additional options for better reliability
+      pool: true,
+      maxConnections: 5,
+      maxMessages: 100,
+      rateDelta: 1000,
+      rateLimit: 5
+    };
+
+    // Add service-specific configurations
+    if (smtpConfig.host.includes('gmail')) {
+      transporterConfig.service = 'gmail';
+    } else if (smtpConfig.host.includes('outlook') || smtpConfig.host.includes('hotmail')) {
+      transporterConfig.service = 'hotmail';
+    }
+
+    console.log('🔧 Creating SMTP transporter...');
+    const transporter = nodemailer.createTransport(transporterConfig);
+
+    // Verify SMTP connection before sending
+    try {
+      await transporter.verify();
+      console.log('✅ SMTP connection verified successfully');
+    } catch (verifyError) {
+      throw new Error(`SMTP verification failed: ${verifyError.message}`);
+    }
 
     // Process recipients in batches
     const batchSize = 5;
     let processedCount = 0;
+    let sentCount = 0;
+    let failedCount = 0;
+
+    console.log(`📦 Processing ${campaign.recipients.length} recipients in batches of ${batchSize}`);
 
     for (let i = 0; i < campaign.recipients.length; i += batchSize) {
       const batch = campaign.recipients.slice(i, i + batchSize);
+      const batchNumber = Math.floor(i / batchSize) + 1;
+      const totalBatches = Math.ceil(campaign.recipients.length / batchSize);
       
-      const batchPromises = batch.map(async (recipient) => {
+      console.log(`\n📦 Batch ${batchNumber}/${totalBatches} - Processing ${batch.length} emails`);
+      
+      const batchPromises = batch.map(async (recipient, index) => {
         try {
           // Replace template variables
-          let emailContent = campaign.content;
-          emailContent = emailContent.replace(/{{first_name}}/g, recipient.name.split(' ')[0] || '');
-          emailContent = emailContent.replace(/{{last_name}}/g, recipient.name.split(' ')[1] || '');
+          let emailContent = campaign.content || '';
+          const firstName = (recipient.name || '').split(' ')[0] || '';
+          const lastName = (recipient.name || '').split(' ').slice(1).join(' ') || '';
+          
+          emailContent = emailContent.replace(/{{first_name}}/g, firstName);
+          emailContent = emailContent.replace(/{{last_name}}/g, lastName);
+          emailContent = emailContent.replace(/{{full_name}}/g, recipient.name || '');
           emailContent = emailContent.replace(/{{email}}/g, recipient.email);
           emailContent = emailContent.replace(/{{company_name}}/g, 'MarketingHub');
-          emailContent = emailContent.replace(/{{year}}/g, new Date().getFullYear());
+          emailContent = emailContent.replace(/{{year}}/g, new Date().getFullYear().toString());
 
           const mailOptions = {
             from: `${campaign.settings.fromName} <${campaign.settings.fromEmail}>`,
@@ -384,10 +637,18 @@ async function processCampaign(campaignId) {
             replyTo: campaign.settings.replyTo
           };
 
-          await transporter.sendMail(mailOptions);
+          console.log(`📤 Sending to: ${recipient.email}`);
+          const info = await transporter.sendMail(mailOptions);
+          console.log(`✅ Sent to ${recipient.email} - MessageId: ${info.messageId}`);
           
-          recipient.status = 'sent';
-          recipient.sentAt = new Date();
+          // Update recipient status
+          const recipientIndex = campaign.recipients.findIndex(r => r.email === recipient.email);
+          if (recipientIndex !== -1) {
+            campaign.recipients[recipientIndex].status = 'sent';
+            campaign.recipients[recipientIndex].sentAt = new Date();
+          }
+          
+          sentCount++;
           
           // Save email activity
           const emailActivity = new EmailActivity({
@@ -395,7 +656,7 @@ async function processCampaign(campaignId) {
             campaign: campaign._id,
             recipient: {
               email: recipient.email,
-              name: recipient.name
+              name: recipient.name || ''
             },
             sender: {
               email: campaign.settings.fromEmail,
@@ -410,7 +671,7 @@ async function processCampaign(campaignId) {
             emailDetails: {
               subject: campaign.subject,
               content: emailContent,
-              messageId: `campaign_${campaign._id}_${Date.now()}`,
+              messageId: info.messageId,
               smtpConfig: campaign.settings.smtpConfigId
             },
             status: 'sent',
@@ -418,7 +679,7 @@ async function processCampaign(campaignId) {
               sentAt: new Date()
             },
             response: {
-              smtpResponse: 'Message sent successfully',
+              smtpResponse: info.response,
               deliveryStatus: 'sent'
             },
             metadata: {
@@ -428,21 +689,38 @@ async function processCampaign(campaignId) {
           });
           
           await emailActivity.save();
-          processedCount++;
+          
         } catch (error) {
-          console.error(`Error sending to ${recipient.email}:`, error);
-          recipient.status = 'failed';
-          recipient.errorMessage = error.message;
+          console.error(`❌ Failed to send to ${recipient.email}:`, error.message);
+          
+          // Update recipient status
+          const recipientIndex = campaign.recipients.findIndex(r => r.email === recipient.email);
+          if (recipientIndex !== -1) {
+            campaign.recipients[recipientIndex].status = 'failed';
+            campaign.recipients[recipientIndex].errorMessage = error.message;
+          }
+          
+          failedCount++;
         }
+        
+        processedCount++;
       });
 
       await Promise.all(batchPromises);
       
+      // Update campaign stats
+      campaign.stats.sent = sentCount;
+      campaign.stats.failed = failedCount;
+      campaign.stats.pending = campaign.recipients.length - processedCount;
+      
       // Save progress
       await campaign.save();
       
-      // Add delay between batches
+      console.log(`📊 Batch ${batchNumber} completed - Sent: ${sentCount}, Failed: ${failedCount}, Remaining: ${campaign.recipients.length - processedCount}`);
+      
+      // Add delay between batches to avoid rate limiting
       if (i + batchSize < campaign.recipients.length) {
+        console.log('⏳ Waiting 2 seconds before next batch...');
         await new Promise(resolve => setTimeout(resolve, 2000));
       }
     }
@@ -453,21 +731,36 @@ async function processCampaign(campaignId) {
     await campaign.save();
 
     // Update user usage
-    const user = await User.findById(campaign.user);
-    user.usage.emailsSent += campaign.stats.sent;
-    await user.save();
+    if (campaign.user && sentCount > 0) {
+      await User.findByIdAndUpdate(campaign.user._id, {
+        $inc: { 'usage.emailsSent': sentCount }
+      });
+    }
 
-    console.log(`Campaign ${campaignId} completed. Sent: ${campaign.stats.sent}, Failed: ${campaign.stats.failed}`);
+    console.log(`\n🎉 ===== CAMPAIGN COMPLETED: ${campaignId} =====`);
+    console.log(`✅ Successfully sent: ${sentCount} emails`);
+    console.log(`❌ Failed: ${failedCount} emails`);
+    console.log(`📊 Total processed: ${processedCount} recipients`);
+
+    // Close transporter pool
+    transporter.close();
 
   } catch (error) {
-    console.error('Process campaign error:', error);
+    console.error(`\n💥 ===== CAMPAIGN PROCESSING FAILED: ${campaignId} =====`);
+    console.error(`❌ Error: ${error.message}`);
+    console.error(`📍 Stack:`, error.stack);
     
     // Mark campaign as failed
-    await Campaign.findByIdAndUpdate(campaignId, {
-      status: 'failed',
-      error: error.message,
-      completedAt: new Date()
-    });
+    try {
+      await Campaign.findByIdAndUpdate(campaignId, {
+        status: 'failed',
+        error: error.message,
+        completedAt: new Date()
+      });
+      console.log('💾 Campaign marked as failed in database');
+    } catch (updateError) {
+      console.error('❌ Failed to update campaign status:', updateError.message);
+    }
   }
 }
 

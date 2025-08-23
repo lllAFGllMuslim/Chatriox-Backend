@@ -45,7 +45,22 @@ const campaignSchema = new mongoose.Schema({
     fromEmail: String,
     replyTo: String,
     trackOpens: { type: Boolean, default: true },
-    trackClicks: { type: Boolean, default: true }
+    trackClicks: { type: Boolean, default: true },
+    // ✅ ADD THESE MISSING FIELDS:
+    smtpConfigId: { 
+      type: mongoose.Schema.Types.ObjectId, 
+      ref: 'SMTPConfig',
+      required: function() { return this.type === 'email'; }
+    },
+    templateId: { 
+      type: mongoose.Schema.Types.Mixed, // Can be ObjectId or String (for system templates)
+      required: true
+    },
+    contactListId: { 
+      type: mongoose.Schema.Types.ObjectId, 
+      ref: 'ContactList',
+      required: true
+    }
   },
   schedule: {
     isScheduled: { type: Boolean, default: false },
@@ -54,7 +69,7 @@ const campaignSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ['draft', 'pending','scheduled', 'sending', 'sent', 'completed', 'failed'],
+    enum: ['draft', 'pending','scheduled', 'sending', 'sent', 'completed', 'failed', 'cancelled'],
     default: 'draft'
   },
   stats: {
@@ -65,10 +80,15 @@ const campaignSchema = new mongoose.Schema({
     clicked: { type: Number, default: 0 },
     bounced: { type: Number, default: 0 },
     failed: { type: Number, default: 0 },
+    pending: { type: Number, default: 0 }, // ✅ ADD THIS
+    unsubscribed: { type: Number, default: 0 }, // ✅ ADD THIS
     openRate: { type: Number, default: 0 },
     clickRate: { type: Number, default: 0 },
     bounceRate: { type: Number, default: 0 }
   },
+  // ✅ ADD ERROR FIELD:
+  error: String,
+  
   createdAt: {
     type: Date,
     default: Date.now
@@ -88,21 +108,27 @@ campaignSchema.pre('save', function(next) {
   // Calculate stats
   const recipients = this.recipients;
   this.stats.totalRecipients = recipients.length;
-  this.stats.sent = recipients.filter(r => r.status !== 'pending' && r.status !== 'failed').length;
-  this.stats.delivered = recipients.filter(r => r.status === 'delivered' || r.status === 'opened' || r.status === 'clicked').length;
-  this.stats.opened = recipients.filter(r => r.status === 'opened' || r.status === 'clicked').length;
+  this.stats.sent = recipients.filter(r => ['sent', 'delivered', 'opened', 'clicked'].includes(r.status)).length;
+  this.stats.delivered = recipients.filter(r => ['delivered', 'opened', 'clicked'].includes(r.status)).length;
+  this.stats.opened = recipients.filter(r => ['opened', 'clicked'].includes(r.status)).length;
   this.stats.clicked = recipients.filter(r => r.status === 'clicked').length;
   this.stats.bounced = recipients.filter(r => r.status === 'bounced').length;
   this.stats.failed = recipients.filter(r => r.status === 'failed').length;
+  this.stats.pending = recipients.filter(r => r.status === 'pending').length;
   
   // Calculate rates
   if (this.stats.sent > 0) {
-    this.stats.openRate = (this.stats.opened / this.stats.sent) * 100;
-    this.stats.clickRate = (this.stats.clicked / this.stats.sent) * 100;
-    this.stats.bounceRate = (this.stats.bounced / this.stats.sent) * 100;
+    this.stats.openRate = Math.round((this.stats.opened / this.stats.sent) * 100 * 100) / 100; // Round to 2 decimals
+    this.stats.clickRate = Math.round((this.stats.clicked / this.stats.sent) * 100 * 100) / 100;
+    this.stats.bounceRate = Math.round((this.stats.bounced / this.stats.sent) * 100 * 100) / 100;
   }
   
   next();
 });
+
+// ✅ ADD USEFUL INDEXES:
+campaignSchema.index({ user: 1, createdAt: -1 });
+campaignSchema.index({ status: 1 });
+campaignSchema.index({ 'schedule.scheduledAt': 1, status: 1 });
 
 module.exports = mongoose.model('Campaign', campaignSchema);
