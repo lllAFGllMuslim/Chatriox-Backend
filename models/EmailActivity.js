@@ -19,10 +19,21 @@ const emailActivitySchema = new mongoose.Schema({
     name: String
   },
   template: {
-    id: { type: mongoose.Schema.Types.ObjectId, ref: 'Template' },
+    // FIXED: Allow both ObjectId (user templates) and String (system templates)
+    id: { 
+      type: mongoose.Schema.Types.Mixed, // Allows both ObjectId and String
+      required: false // Make it optional since system templates don't have ObjectId
+    },
     name: String,
     subject: String,
-    content: String
+    content: String,
+    // NEW: Add fields to distinguish template types
+    type: {
+      type: String,
+      enum: ['user', 'system'],
+      default: 'user'
+    },
+    systemId: String // Store original system template ID like "system_newsletter"
   },
   emailDetails: {
     subject: { type: String, required: true },
@@ -74,5 +85,7 @@ emailActivitySchema.index({ 'recipient.email': 1 });
 emailActivitySchema.index({ campaign: 1 });
 emailActivitySchema.index({ status: 1 });
 emailActivitySchema.index({ 'tracking.sentAt': -1 });
+// NEW: Index for template queries
+emailActivitySchema.index({ 'template.type': 1, 'template.id': 1 });
 
 module.exports = mongoose.model('EmailActivity', emailActivitySchema);
