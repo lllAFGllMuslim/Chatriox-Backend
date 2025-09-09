@@ -574,20 +574,12 @@ async function processCampaign(campaignId) {
         user: smtpConfig.username,
         pass: decryptedPassword
       },
-      // Additional options for better reliability
       pool: true,
       maxConnections: 5,
       maxMessages: 100,
       rateDelta: 1000,
       rateLimit: 5
     };
-
-    // Add service-specific configurations
-    if (smtpConfig.host.includes('gmail')) {
-      transporterConfig.service = 'gmail';
-    } else if (smtpConfig.host.includes('outlook') || smtpConfig.host.includes('hotmail')) {
-      transporterConfig.service = 'hotmail';
-    }
 
     console.log('🔧 Creating SMTP transporter...');
     const transporter = nodemailer.createTransport(transporterConfig);
@@ -616,43 +608,11 @@ async function processCampaign(campaignId) {
       console.log(`\n📦 Batch ${batchNumber}/${totalBatches} - Processing ${batch.length} emails`);
       
       const batchPromises = batch.map(async (recipient, index) => {
+        let emailActivity = null; // Declare at function scope
         try {
-          // Replace template variables
-          let emailContent = campaign.content || '';
-          const firstName = (recipient.name || '').split(' ')[0] || '';
-          const lastName = (recipient.name || '').split(' ').slice(1).join(' ') || '';
-          
-          emailContent = emailContent.replace(/{{first_name}}/g, firstName);
-          emailContent = emailContent.replace(/{{last_name}}/g, lastName);
-          emailContent = emailContent.replace(/{{full_name}}/g, recipient.name || '');
-          emailContent = emailContent.replace(/{{email}}/g, recipient.email);
-          emailContent = emailContent.replace(/{{company_name}}/g, 'MarketingHub');
-          emailContent = emailContent.replace(/{{year}}/g, new Date().getFullYear().toString());
-
-          const mailOptions = {
-            from: `${campaign.settings.fromName} <${campaign.settings.fromEmail}>`,
-            to: recipient.email,
-            subject: campaign.subject,
-            html: emailContent,
-            replyTo: campaign.settings.replyTo
-          };
-
-          console.log(`📤 Sending to: ${recipient.email}`);
-          const info = await transporter.sendMail(mailOptions);
-          console.log(`✅ Sent to ${recipient.email} - MessageId: ${info.messageId}`);
-          
-          // Update recipient status
-          const recipientIndex = campaign.recipients.findIndex(r => r.email === recipient.email);
-          if (recipientIndex !== -1) {
-            campaign.recipients[recipientIndex].status = 'sent';
-            campaign.recipients[recipientIndex].sentAt = new Date();
-          }
-          
-          sentCount++;
-          
-          // Save email activity
-          const emailActivity = new EmailActivity({
-            user: campaign.user,
+          // STEP 1: Create EmailActivity record FIRST
+          emailActivity = new EmailActivity({
+            user: campaign.user._id,
             campaign: campaign._id,
             recipient: {
               email: recipient.email,
@@ -666,34 +626,111 @@ async function processCampaign(campaignId) {
               id: campaign.settings.templateId,
               name: 'Campaign Template',
               subject: campaign.subject,
-              content: emailContent
+              content: campaign.content
             },
             emailDetails: {
               subject: campaign.subject,
-              content: emailContent,
-              messageId: info.messageId,
+              content: campaign.content,
               smtpConfig: campaign.settings.smtpConfigId
             },
-            status: 'sent',
+            status: 'pending', // Start as pending
             tracking: {
-              sentAt: new Date()
-            },
-            response: {
-              smtpResponse: info.response,
-              deliveryStatus: 'sent'
+              opens: 0,
+              clicks: 0,
+              sentAt: null,
+              openedAt: null,
+              clickedAt: null
             },
             metadata: {
-              emailSize: emailContent.length,
               tags: ['campaign', campaign.name.toLowerCase().replace(/\s+/g, '-')]
             }
           });
           
           await emailActivity.save();
+          console.log(`📝 EmailActivity created: ${emailActivity._id}`);
+
+          // STEP 2: Process email content with tracking
+          let emailContent = campaign.content || '';
+          const firstName = (recipient.name || '').split(' ')[0] || '';
+          const lastName = (recipient.name || '').split(' ').slice(1).join(' ') || '';
+          
+          // Replace template variables
+          emailContent = emailContent.replace(/{{first_name}}/g, firstName);
+          emailContent = emailContent.replace(/{{last_name}}/g, lastName);
+          emailContent = emailContent.replace(/{{full_name}}/g, recipient.name || '');
+          emailContent = emailContent.replace(/{{email}}/g, recipient.email);
+          emailContent = emailContent.replace(/{{company_name}}/g, 'MarketingHub');
+          emailContent = emailContent.replace(/{{year}}/g, new Date().getFullYear().toString());
+
+          // STEP 3: Add tracking pixel for opens
+          const trackingPixel = `<img src="${process.env.BASE_URL || 'https://chatriox.com'}/api/email-tracking/track-open/${emailActivity._id}" width="1" height="1" style="display:none;" alt="">`;
+          
+          // STEP 4: Wrap links with click tracking
+          const baseUrl = process.env.BASE_URL || 'https://chatriox.com';
+          emailContent = emailContent.replace(
+            /<a\s+([^>]*?)href\s*=\s*["']([^"']+)["']([^>]*?)>/gi,
+            (match, beforeHref, url, afterHref) => {
+              const trackingUrl = `${baseUrl}/api/email-tracking/track-click/${emailActivity._id}?url=${encodeURIComponent(url)}`;
+              return `<a ${beforeHref}href="${trackingUrl}"${afterHref}>`;
+            }
+          );
+
+          // STEP 5: Add tracking pixel before closing body tag or at the end
+          if (emailContent.includes('</body>')) {
+            emailContent = emailContent.replace('</body>', `${trackingPixel}</body>`);
+          } else {
+            emailContent += trackingPixel;
+          }
+
+          // Update the activity with final content
+          emailActivity.emailDetails.content = emailContent;
+          emailActivity.emailDetails.emailSize = emailContent.length;
+
+          const mailOptions = {
+            from: `${campaign.settings.fromName} <${campaign.settings.fromEmail}>`,
+            to: recipient.email,
+            subject: campaign.subject,
+            html: emailContent,
+            replyTo: campaign.settings.replyTo
+          };
+
+          console.log(`📤 Sending to: ${recipient.email}`);
+          const info = await transporter.sendMail(mailOptions);
+          console.log(`✅ Sent to ${recipient.email} - MessageId: ${info.messageId}`);
+          
+          // STEP 6: Update EmailActivity with success
+          emailActivity.status = 'sent';
+          emailActivity.tracking.sentAt = new Date();
+          emailActivity.emailDetails.messageId = info.messageId;
+          emailActivity.response = {
+            smtpResponse: info.response,
+            deliveryStatus: 'sent'
+          };
+          await emailActivity.save();
+          
+          // Update recipient status in campaign
+          const recipientIndex = campaign.recipients.findIndex(r => r.email === recipient.email);
+          if (recipientIndex !== -1) {
+            campaign.recipients[recipientIndex].status = 'sent';
+            campaign.recipients[recipientIndex].sentAt = new Date();
+          }
+          
+          sentCount++;
           
         } catch (error) {
           console.error(`❌ Failed to send to ${recipient.email}:`, error.message);
           
-          // Update recipient status
+          // Update EmailActivity with failure
+          if (emailActivity) {
+            emailActivity.status = 'failed';
+            emailActivity.response = {
+              error: error.message,
+              deliveryStatus: 'failed'
+            };
+            await emailActivity.save();
+          }
+          
+          // Update recipient status in campaign
           const recipientIndex = campaign.recipients.findIndex(r => r.email === recipient.email);
           if (recipientIndex !== -1) {
             campaign.recipients[recipientIndex].status = 'failed';

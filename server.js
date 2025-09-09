@@ -55,6 +55,7 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/marketing
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/dashboard', require('./routes/dashboard'));
 app.use('/api/email', require('./routes/email'));
+app.use('/api/analysis', require('./routes/analysis'));
 app.use('/api/gmail', require('./routes/gmail'));
 app.use('/api/validation', require('./routes/validation'));
 app.use('/api/scraper', require('./routes/scraper'));

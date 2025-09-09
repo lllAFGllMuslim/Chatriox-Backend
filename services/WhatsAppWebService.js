@@ -129,144 +129,214 @@ async initializeClient(accountId, userId, io = null) {
   }
 }
 
-  setupClientEvents(client, accountIdStr, userId, account, io) {
-    // Handle client errors first
-    client.on('error', (error) => {
-      console.error(`🚫 Client error for ${accountIdStr}:`, error);
-      this.handleClientError(accountIdStr, userId, error, io);
-    });
+// In WhatsAppWebService.js - Update the setupClientEvents method
 
-    client.on('qr', async (qr) => {
-      try {
-        console.log(`📱 QR Code generated for account: ${accountIdStr}`);
-        const dataUrl = await QRCode.toDataURL(qr);
-        this.qrCodes.set(accountIdStr, dataUrl);
-        
-        try {
-          account.qrCode = dataUrl;
-          account.status = 'connecting';
-          await account.save();
-        } catch (dbErr) {
-          console.error('Failed to save QR dataUrl to database:', dbErr);
-        }
+setupClientEvents(client, accountIdStr, userId, account, io) {
+  // Handle client errors first
+  client.on('error', (error) => {
+    console.error(`🚫 Client error for ${accountIdStr}:`, error);
+    this.handleClientError(accountIdStr, userId, error, io);
+  });
 
-        this.emitToUser(userId, 'qr_code', {
-          accountId: accountIdStr,
-          qrCode: dataUrl,
-          timestamp: new Date().toISOString()
-        }, io);
-      } catch (err) {
-        console.error('Failed to convert QR to data URL:', err);
-        this.handleClientError(accountIdStr, userId, err, io);
-      }
-    });
-
-    client.on('authenticated', async () => {
-      console.log(`✅ Authenticated for account: ${accountIdStr}`);
-      try {
-        account.status = 'authenticated';
-        account.qrCode = null;
-        await account.save();
-      } catch (error) {
-        console.error('Database update failed:', error);
-      }
-      this.qrCodes.delete(accountIdStr);
-      this.emitToUser(userId, 'whatsapp_authenticated', { accountId: accountIdStr }, io);
-    });
-
-    client.on('ready', async () => {
-      console.log(`🚀 Client ready for account: ${accountIdStr}`);
+  client.on('qr', async (qr) => {
+    try {
+      console.log(`📱 QR Code generated for account: ${accountIdStr}`);
+      const dataUrl = await QRCode.toDataURL(qr);
+      this.qrCodes.set(accountIdStr, dataUrl);
       
-      this.connectionHealth.set(accountIdStr, { 
-        status: 'ready', 
-        lastCheck: Date.now(),
-        phoneNumber: client.info?.wid?.user 
+      // Update database status
+      await WhatsAppAccount.findByIdAndUpdate(accountIdStr, {
+        qrCode: dataUrl,
+        status: 'connecting',
+        errorMessage: null,
+        updatedAt: new Date()
       });
 
-      try {
-        account.status = 'ready';
-        account.isConnected = true;
-        account.lastActivity = new Date();
-        
-        if (client.info?.wid) {
-          account.phoneNumber = client.info.wid.user;
-        }
-        
-        await account.save();
-      } catch (error) {
-        console.error('Database update failed:', error);
-      }
-
-      this.emitToUser(userId, 'whatsapp_ready', {
+      // Emit to user immediately
+      this.emitToUser(userId, 'qr_code', {
         accountId: accountIdStr,
-        phoneNumber: account.phoneNumber,
-        profileName: client.info?.pushname || 'Unknown'
+        qrCode: dataUrl,
+        timestamp: new Date().toISOString()
       }, io);
+    } catch (err) {
+      console.error('Failed to convert QR to data URL:', err);
+      this.handleClientError(accountIdStr, userId, err, io);
+    }
+  });
 
-      // Reset reconnection attempts on successful connection
-      this.reconnectAttempts.delete(accountIdStr);
+  client.on('authenticated', async () => {
+    console.log(`✅ Authenticated for account: ${accountIdStr}`);
+    
+    this.connectionHealth.set(accountIdStr, { 
+      status: 'authenticated', 
+      lastCheck: Date.now(),
+      userId: userId
     });
-
-    client.on('disconnected', async (reason) => {
-      console.log(`🔌 Client disconnected for ${accountIdStr}. Reason: ${reason}`);
-      
-      this.connectionHealth.set(accountIdStr, { 
-        status: 'disconnected', 
-        lastCheck: Date.now() 
+    
+    try {
+      await WhatsAppAccount.findByIdAndUpdate(accountIdStr, {
+        status: 'authenticated',
+        qrCode: null,
+        errorMessage: null,
+        updatedAt: new Date()
       });
+    } catch (error) {
+      console.error('Database update failed:', error);
+    }
+    
+    this.qrCodes.delete(accountIdStr);
+    
+    // Emit authenticated event
+    this.emitToUser(userId, 'whatsapp_authenticated', { 
+      accountId: accountIdStr,
+      status: 'authenticated'
+    }, io);
+  });
 
-      try {
-        account.status = 'disconnected';
-        account.isConnected = false;
-        account.errorMessage = `Disconnected: ${reason}`;
-        await account.save();
-      } catch (error) {
-        console.error('Database update failed:', error);
-      }
-
-      this.emitToUser(userId, 'whatsapp_disconnected', {
-        accountId: accountIdStr,
-        reason: reason
-      }, io);
-
-      // Clean up the disconnected client
-      await this.safeCleanupClient(accountIdStr);
-
-      // Attempt reconnection for unexpected disconnects (but not for logout or navigation)
-      if (reason !== 'LOGOUT' && reason !== 'NAVIGATION' && !reason.includes('Protocol error')) {
-        this.scheduleReconnection(accountIdStr, userId, io);
-      }
+  client.on('ready', async () => {
+    console.log(`🚀 Client ready for account: ${accountIdStr}`);
+    
+    // CRITICAL: Update connection health first
+    this.connectionHealth.set(accountIdStr, { 
+      status: 'ready', 
+      lastCheck: Date.now(),
+      userId: userId,
+      phoneNumber: client.info?.wid?.user 
     });
 
-    client.on('auth_failure', async (error) => {
-      console.log(`🚫 Auth failure for ${accountIdStr}:`, error);
+    try {
+      // Get the latest account info from WhatsApp
+      const phoneNumber = client.info?.wid?.user;
+      const profileName = client.info?.pushname || 'Unknown';
       
-      this.connectionHealth.set(accountIdStr, { 
-        status: 'auth_failed', 
-        lastCheck: Date.now() 
+      // Update database with complete ready status
+      await WhatsAppAccount.findByIdAndUpdate(accountIdStr, {
+        status: 'ready',
+        isConnected: true,
+        phoneNumber: phoneNumber,
+        profileName: profileName,
+        lastActivity: new Date(),
+        errorMessage: null,
+        qrCode: null,
+        updatedAt: new Date()
       });
+      
+      console.log(`📱 Account ready - Phone: ${phoneNumber}, Profile: ${profileName}`);
+    } catch (error) {
+      console.error('Database update failed:', error);
+    }
 
-      try {
-        account.status = 'failed';
-        account.errorMessage = 'Authentication failed - please reconnect';
-        await account.save();
-      } catch (dbError) {
-        console.error('Database update failed:', dbError);
-      }
+    // CRITICAL: Emit ready event with complete data
+    this.emitToUser(userId, 'whatsapp_ready', {
+      accountId: accountIdStr,
+      status: 'ready',
+      phoneNumber: client.info?.wid?.user,
+      profileName: client.info?.pushname || 'Unknown',
+      isConnected: true,
+      timestamp: new Date().toISOString()
+    }, io);
 
-      await this.safeCleanupClient(accountIdStr);
-
-      this.emitToUser(userId, 'whatsapp_auth_failed', {
+    // Reset reconnection attempts on successful connection
+    this.reconnectAttempts.delete(accountIdStr);
+    
+    // Additional verification - emit status update after a short delay
+    setTimeout(() => {
+      this.emitToUser(userId, 'connection_status_update', {
         accountId: accountIdStr,
-        error: error.toString()
+        status: 'ready',
+        verified: true
       }, io);
+    }, 1000);
+  });
+
+  client.on('disconnected', async (reason) => {
+    console.log(`🔌 Client disconnected for ${accountIdStr}. Reason: ${reason}`);
+    
+    this.connectionHealth.set(accountIdStr, { 
+      status: 'disconnected', 
+      lastCheck: Date.now(),
+      reason: reason
     });
 
-    // Message acknowledgment tracking
-    client.on('message_ack', (msg, ack) => {
-      this.handleMessageAck(msg, ack, accountIdStr).catch(console.error);
+    try {
+      await WhatsAppAccount.findByIdAndUpdate(accountIdStr, {
+        status: 'disconnected',
+        isConnected: false,
+        errorMessage: `Disconnected: ${reason}`,
+        updatedAt: new Date()
+      });
+    } catch (error) {
+      console.error('Database update failed:', error);
+    }
+
+    this.emitToUser(userId, 'whatsapp_disconnected', {
+      accountId: accountIdStr,
+      reason: reason,
+      status: 'disconnected'
+    }, io);
+
+    // Clean up the disconnected client
+    await this.safeCleanupClient(accountIdStr);
+
+    // Attempt reconnection for unexpected disconnects
+    if (reason !== 'LOGOUT' && reason !== 'NAVIGATION' && !reason.includes('Protocol error')) {
+      this.scheduleReconnection(accountIdStr, userId, io);
+    }
+  });
+
+  client.on('auth_failure', async (error) => {
+    console.log(`🚫 Auth failure for ${accountIdStr}:`, error);
+    
+    this.connectionHealth.set(accountIdStr, { 
+      status: 'auth_failed', 
+      lastCheck: Date.now(),
+      error: error.toString()
     });
-  }
+
+    try {
+      await WhatsAppAccount.findByIdAndUpdate(accountIdStr, {
+        status: 'failed',
+        isConnected: false,
+        errorMessage: 'Authentication failed - please reconnect',
+        updatedAt: new Date()
+      });
+    } catch (dbError) {
+      console.error('Database update failed:', dbError);
+    }
+
+    await this.safeCleanupClient(accountIdStr);
+
+    this.emitToUser(userId, 'whatsapp_auth_failed', {
+      accountId: accountIdStr,
+      error: error.toString(),
+      status: 'failed'
+    }, io);
+  });
+
+  // Message acknowledgment tracking
+  client.on('message_ack', (msg, ack) => {
+    this.handleMessageAck(msg, ack, accountIdStr).catch(console.error);
+  });
+  
+  // Additional connection monitoring
+  client.on('change_state', (state) => {
+    console.log(`🔄 State change for ${accountIdStr}: ${state}`);
+    
+    // Update connection health
+    this.connectionHealth.set(accountIdStr, { 
+      ...this.connectionHealth.get(accountIdStr),
+      lastState: state,
+      lastCheck: Date.now()
+    });
+    
+    // Emit state change to frontend
+    this.emitToUser(userId, 'whatsapp_state_change', {
+      accountId: accountIdStr,
+      state: state,
+      timestamp: new Date().toISOString()
+    }, io);
+  });
+}
 
   // New method to handle client errors gracefully
   async handleClientError(accountIdStr, userId, error, io) {

@@ -43,7 +43,7 @@ const emailActivitySchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ['sent', 'delivered', 'opened', 'clicked', 'bounced', 'failed'],
+    enum: ['sent', 'delivered', 'pending', 'opened', 'clicked', 'bounced', 'failed'],
     default: 'sent'
   },
   tracking: {
