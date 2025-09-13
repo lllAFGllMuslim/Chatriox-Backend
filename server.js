@@ -55,7 +55,7 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/marketing
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/dashboard', require('./routes/dashboard'));
 app.use('/api/email', require('./routes/email'));
-app.use('/api/analysis', require('./routes/analysis'));
+app.use('/api/analysis', require('./routes/emailanalysis'));
 app.use('/api/gmail', require('./routes/gmail'));
 app.use('/api/validation', require('./routes/validation'));
 app.use('/api/scraper', require('./routes/scraper'));
@@ -67,6 +67,7 @@ app.use('/api/admin', require('./routes/admin'));
 app.use('/api/smtp', require('./routes/smtp'));
 app.use('/api/contacts', require('./routes/contacts'));
 app.use('/api/templates', require('./routes/templates'));
+app.use('/api/email-templates', require('./routes/email-templates'));
 app.use('/api/campaigns', require('./routes/campaigns'));
 app.use('/api/email-tracking', require('./routes/email-tracking'));
 app.use('/api/whatsapp-web', require('./routes/whatsapp-web'));

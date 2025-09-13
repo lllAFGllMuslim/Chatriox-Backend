@@ -7,11 +7,10 @@ class AIAnalysisService {
   constructor() {
     this.perplexityApiUrl = 'https://api.perplexity.ai/chat/completions';
     this.apiKey = process.env.PERPLEXITY_API_KEY;
-    // Updated to use current valid model
-    this.model = 'sonar'; 
-    
+    this.model = 'sonar';
+
     if (!this.apiKey) {
-      console.warn('⚠️ PERPLEXITY_API_KEY not found in environment variables');
+      console.warn('⚠ PERPLEXITY_API_KEY not found in environment variables');
     }
   }
 
@@ -22,40 +21,97 @@ class AIAnalysisService {
 
     try {
       console.log('🤖 Calling Perplexity API with model:', this.model);
-      
+
       const requestData = {
         model: this.model,
         messages: messages,
-        max_tokens: 700,
-        temperature: options.temperature || 0.2,
-        top_p: options.topP || 0.9,
-        return_citations: true,
-        search_domain_filter: ["perplexity.ai"],
+        max_tokens: 500,
+        temperature: options.temperature || 0.1,
+        top_p: options.topP || 0.8,
+        return_citations: false,
         return_images: false,
         return_related_questions: false,
-        search_recency_filter: "month",
-        top_k: 0,
+        search_recency_filter: 'month',
         stream: false,
         presence_penalty: 0,
         frequency_penalty: 1
       };
 
+      console.log('📤 Request payload:', JSON.stringify(requestData, null, 2));
+
       const response = await axios.post(this.perplexityApiUrl, requestData, {
         headers: {
-          'Authorization': `Bearer ${this.apiKey}`,
+          Authorization: `Bearer ${this.apiKey}`,
           'Content-Type': 'application/json'
         },
-        timeout: 30000 // 30 seconds timeout
+        timeout: 25000
       });
 
-      if (response.data && response.data.choices && response.data.choices[0]) {
-        return response.data.choices[0].message.content;
-      } else {
-        throw new Error('Invalid response structure from Perplexity API');
+      console.log('📥 Raw API response:', JSON.stringify(response.data, null, 2));
+
+      // Enhanced response validation with detailed logging
+      if (!response.data) {
+        console.error('❌ No response data received');
+        throw new Error('No response data received from Perplexity API');
       }
 
+      if (!response.data.choices) {
+        console.error('❌ No choices array in response:', response.data);
+        throw new Error('Invalid response structure: missing choices array');
+      }
+
+      if (!Array.isArray(response.data.choices)) {
+        console.error('❌ Choices is not an array:', typeof response.data.choices);
+        throw new Error('Invalid response structure: choices is not an array');
+      }
+
+      if (response.data.choices.length === 0) {
+        console.error('❌ Empty choices array');
+        throw new Error('Invalid response structure: empty choices array');
+      }
+
+      const firstChoice = response.data.choices[0];
+      console.log('🔍 First choice structure:', JSON.stringify(firstChoice, null, 2));
+
+      if (!firstChoice) {
+        console.error('❌ First choice is undefined');
+        throw new Error('Invalid response structure: first choice is undefined');
+      }
+
+      if (!firstChoice.message) {
+        console.error('❌ No message in first choice:', firstChoice);
+        throw new Error('Invalid response structure: missing message in first choice');
+      }
+
+      if (!firstChoice.message.content) {
+        console.error('❌ No content in message:', firstChoice.message);
+        throw new Error('Invalid response structure: missing content in message');
+      }
+
+      const content = firstChoice.message.content;
+      console.log('✅ Successfully extracted content:', content.substring(0, 200) + '...');
+      
+      return content;
+
     } catch (error) {
-      console.error('❌ Perplexity API error:', error.response?.data || error.message);
+      console.error('❌ Perplexity API error details:');
+      console.error('Error type:', error.constructor.name);
+      console.error('Error message:', error.message);
+      
+      if (error.response) {
+        console.error('Response status:', error.response.status);
+        console.error('Response headers:', error.response.headers);
+        console.error('Response data:', error.response.data);
+      }
+      
+      if (error.request) {
+        console.error('Request details:', {
+          url: error.config?.url,
+          method: error.config?.method,
+          headers: error.config?.headers
+        });
+      }
+
       throw new Error(`AI analysis failed: ${error.response?.data?.error?.message || error.message}`);
     }
   }
@@ -76,7 +132,6 @@ class AIAnalysisService {
         };
       }
 
-      // Get email activities for this campaign
       const activities = await EmailActivity.find({
         campaign: campaignId,
         user: userId
@@ -89,28 +144,22 @@ class AIAnalysisService {
         };
       }
 
-      // Calculate campaign metrics
       const metrics = this.calculateCampaignMetrics(activities);
-
-      // Create analysis prompt
-      const analysisPrompt = this.createCampaignAnalysisPrompt(campaign, metrics, activities);
+      const analysisPrompt = this.createCampaignAnalysisPrompt(campaign, metrics);
 
       const messages = [
         {
-          role: "system",
-          content: "You are an expert email marketing analyst. Provide detailed, actionable insights based on campaign performance data. Focus on practical recommendations that can improve future campaigns."
+          role: 'system',
+          content: 'You are an email marketing expert. Analyze campaign performance and provide ONLY actionable recommendations that the client must fix to improve results. No insights or explanations - only specific fixes.'
         },
         {
-          role: "user",
+          role: 'user',
           content: analysisPrompt
         }
       ];
 
-      // Get AI analysis
       const aiResponse = await this.callPerplexityAPI(messages);
-
-      // Parse the response into structured data
-      const structuredInsights = this.parseAIResponse(aiResponse);
+      const structured = this.parseAIResponse(aiResponse);
 
       return {
         success: true,
@@ -119,15 +168,12 @@ class AIAnalysisService {
           campaignName: campaign.name,
           subject: campaign.subject,
           metrics,
-          insights: structuredInsights.insights,
-          recommendations: structuredInsights.recommendations,
-          performance: structuredInsights.performance,
-          benchmarks: structuredInsights.benchmarks,
+          recommendations: structured.recommendations,
+          riskAssessment: structured.riskAssessment,
           generatedAt: new Date(),
           rawResponse: aiResponse
         }
       };
-
     } catch (error) {
       console.error('❌ Campaign analysis error:', error);
       return {
@@ -141,10 +187,9 @@ class AIAnalysisService {
     try {
       console.log(`🤖 Analyzing all campaigns for user: ${userId}`);
 
-      // Calculate date range
       const now = new Date();
       let startDate;
-      
+
       switch (timeRange) {
         case '7d':
           startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
@@ -159,13 +204,11 @@ class AIAnalysisService {
           startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
       }
 
-      // Get all campaigns in the time range - Remove template population or make it conditional
       const campaigns = await Campaign.find({
         user: userId,
         createdAt: { $gte: startDate },
         status: { $in: ['completed', 'failed', 'sending'] }
       });
-
 
       if (campaigns.length === 0) {
         return {
@@ -174,8 +217,7 @@ class AIAnalysisService {
         };
       }
 
-      // Get all email activities for these campaigns
-      const campaignIds = campaigns.map(c => c._id);
+      const campaignIds = campaigns.map((c) => c._id);
       const activities = await EmailActivity.find({
         campaign: { $in: campaignIds },
         user: userId,
@@ -189,35 +231,28 @@ class AIAnalysisService {
         };
       }
 
-      // Calculate overall metrics
       const overallMetrics = this.calculateOverallMetrics(activities);
-      const campaignAnalysis = this.analyzeCampaignPerformance(campaigns, activities);
       const trends = this.calculateTrends(activities, timeRange);
-
-      // Create comprehensive analysis prompt
       const analysisPrompt = this.createOverallAnalysisPrompt(
         overallMetrics,
-        campaignAnalysis,
+        campaigns.length,
         trends,
         timeRange
       );
 
       const messages = [
         {
-          role: "system",
-          content: "You are a senior email marketing strategist with expertise in campaign optimization, audience engagement, and performance analysis. Provide strategic insights that help businesses improve their email marketing ROI."
+          role: 'system',
+          content: 'You are an email marketing strategist. Analyze overall performance and provide ONLY critical fixes the client must implement immediately. No insights - only urgent action items to resolve performance issues.'
         },
         {
-          role: "user",
+          role: 'user',
           content: analysisPrompt
         }
       ];
 
-      // Get AI analysis
       const aiResponse = await this.callPerplexityAPI(messages);
-
-      // Parse the response
-      const structuredInsights = this.parseOverallAIResponse(aiResponse);
+      const structured = this.parseOverallAIResponse(aiResponse);
 
       return {
         success: true,
@@ -228,15 +263,12 @@ class AIAnalysisService {
           totalEmails: activities.length,
           overallMetrics,
           trends,
-          insights: structuredInsights.insights,
-          strategicRecommendations: structuredInsights.strategicRecommendations,
-          keyFindings: structuredInsights.keyFindings,
-          priorityActions: structuredInsights.priorityActions,
+          recommendations: structured.recommendations,
+          riskAssessment: structured.riskAssessment,
           generatedAt: new Date(),
           rawResponse: aiResponse
         }
       };
-
     } catch (error) {
       console.error('❌ Overall analysis error:', error);
       return {
@@ -250,10 +282,12 @@ class AIAnalysisService {
     const total = activities.length;
     if (total === 0) return {};
 
-    const delivered = activities.filter(a => ['delivered', 'opened', 'clicked'].includes(a.status)).length;
-    const opened = activities.filter(a => ['opened', 'clicked'].includes(a.status)).length;
-    const clicked = activities.filter(a => a.status === 'clicked').length;
-    const bounced = activities.filter(a => a.status === 'bounced').length;
+    const delivered = activities.filter((a) =>
+      ['delivered', 'opened', 'clicked'].includes(a.status)
+    ).length;
+    const opened = activities.filter((a) => ['opened', 'clicked'].includes(a.status)).length;
+    const clicked = activities.filter((a) => a.status === 'clicked').length;
+    const bounced = activities.filter((a) => a.status === 'bounced').length;
 
     return {
       totalSent: total,
@@ -273,33 +307,14 @@ class AIAnalysisService {
     return this.calculateCampaignMetrics(activities);
   }
 
-  analyzeCampaignPerformance(campaigns, activities) {
-    return campaigns.map(campaign => {
-      const campaignActivities = activities.filter(a => 
-        a.campaign && a.campaign.toString() === campaign._id.toString()
-      );
-      const metrics = this.calculateCampaignMetrics(campaignActivities);
-      
-      return {
-        id: campaign._id,
-        name: campaign.name,
-        subject: campaign.subject,
-        createdAt: campaign.createdAt,
-        metrics,
-        templateName: campaign.settings?.templateId || 'Unknown'
-      };
-    });
-  }
-
   calculateTrends(activities, timeRange) {
-    // Group activities by day/week based on timeRange
     const groupBy = timeRange === '7d' ? 'day' : timeRange === '30d' ? 'week' : 'month';
-    
+
     const grouped = {};
-    activities.forEach(activity => {
+    activities.forEach((activity) => {
       const date = new Date(activity.createdAt);
       let key;
-      
+
       if (groupBy === 'day') {
         key = date.toISOString().split('T')[0];
       } else if (groupBy === 'week') {
@@ -309,11 +324,11 @@ class AIAnalysisService {
       } else {
         key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
       }
-      
+
       if (!grouped[key]) {
         grouped[key] = { sent: 0, opened: 0, clicked: 0 };
       }
-      
+
       grouped[key].sent++;
       if (['opened', 'clicked'].includes(activity.status)) {
         grouped[key].opened++;
@@ -324,10 +339,9 @@ class AIAnalysisService {
     });
 
     return {
-      dailyEngagement: grouped,
+      engagementTrend: this.calculateEngagementTrend(grouped),
       averageOpenRate: this.calculateAverageMetric(grouped, 'opened', 'sent'),
-      averageClickRate: this.calculateAverageMetric(grouped, 'clicked', 'opened'),
-      engagementTrend: this.calculateEngagementTrend(grouped)
+      averageClickRate: this.calculateAverageMetric(grouped, 'clicked', 'opened')
     };
   }
 
@@ -335,20 +349,20 @@ class AIAnalysisService {
     const values = Object.values(grouped);
     const totalNum = values.reduce((sum, val) => sum + val[numerator], 0);
     const totalDen = values.reduce((sum, val) => sum + val[denominator], 0);
-    
+
     return totalDen > 0 ? (totalNum / totalDen * 100).toFixed(2) : 0;
   }
 
   calculateEngagementTrend(grouped) {
     const sortedKeys = Object.keys(grouped).sort();
     if (sortedKeys.length < 2) return 'insufficient_data';
-    
+
     const firstHalf = sortedKeys.slice(0, Math.floor(sortedKeys.length / 2));
     const secondHalf = sortedKeys.slice(Math.floor(sortedKeys.length / 2));
-    
+
     const firstHalfRate = this.calculateAverageMetricForKeys(grouped, firstHalf, 'opened', 'sent');
     const secondHalfRate = this.calculateAverageMetricForKeys(grouped, secondHalf, 'opened', 'sent');
-    
+
     if (secondHalfRate > firstHalfRate * 1.05) return 'improving';
     if (secondHalfRate < firstHalfRate * 0.95) return 'declining';
     return 'stable';
@@ -360,282 +374,137 @@ class AIAnalysisService {
     return totalDen > 0 ? (totalNum / totalDen * 100) : 0;
   }
 
-  createCampaignAnalysisPrompt(campaign, metrics, activities) {
-    return `
-Analyze this email campaign performance:
+  createCampaignAnalysisPrompt(campaign, metrics) {
+    return `URGENT: Campaign "${campaign.name}" needs immediate fixes.
 
-CAMPAIGN DETAILS:
-- Name: ${campaign.name}
-- Subject: ${campaign.subject}
-- Template: ${campaign.settings?.templateId?.name || campaign.templateName || 'Custom'}
-- Sent Date: ${campaign.createdAt}
+Subject Line: "${campaign.subject}"
 
-PERFORMANCE METRICS:
-- Total Sent: ${metrics.totalSent}
-- Delivery Rate: ${metrics.deliveryRate}%
-- Open Rate: ${metrics.openRate}%
-- Click Rate: ${metrics.clickRate}%
-- Bounce Rate: ${metrics.bounceRate}%
-- Click-to-Open Rate: ${metrics.clickToOpenRate}%
+CRITICAL PERFORMANCE ISSUES:
+- ${metrics.totalSent} emails sent, only ${metrics.deliveryRate}% delivered
+- Open rate: ${metrics.openRate}% (Industry standard: 20-25%)
+- Click rate: ${metrics.clickRate}% (Industry standard: 2-5%) 
+- Bounce rate: ${metrics.bounceRate}% (Should be <2%)
+- Click-to-open rate: ${metrics.clickToOpenRate}% (Should be 10-15%)
 
-ANALYSIS REQUEST:
-1. Evaluate this campaign's performance against industry benchmarks
-2. Identify what worked well and what could be improved
-3. Provide specific, actionable recommendations for similar future campaigns
-4. Consider subject line effectiveness, send timing, and content engagement
+CLIENT MUST FIX THESE 7 CRITICAL ISSUES IMMEDIATELY:
+Provide exactly 7 high-priority action items in this format:
+"HIGH: [Specific fix the client must implement]"
+"MEDIUM: [Specific fix the client must implement]"
+"LOW: [Specific fix the client must implement]"
 
-Please provide insights in a structured format covering performance assessment, key insights, and specific recommendations.
-    `.trim();
+Focus on fixes for deliverability, subject lines, content, timing, and list hygiene.`;
   }
 
-  createOverallAnalysisPrompt(metrics, campaignAnalysis, trends, timeRange) {
-    const topCampaigns = campaignAnalysis
-      .sort((a, b) => parseFloat(b.metrics.openRate) - parseFloat(a.metrics.openRate))
-      .slice(0, 5);
+  createOverallAnalysisPrompt(metrics, campaignCount, trends, timeRange) {
+    return `URGENT: Email program requires immediate intervention (${timeRange} analysis).
 
-    return `
-Analyze this email marketing program performance over the last ${timeRange}:
+CRITICAL PROGRAM FAILURES:
+- ${campaignCount} campaigns sent ${metrics.totalSent} emails
+- Overall delivery rate: ${metrics.deliveryRate}%
+- Program-wide open rate: ${metrics.openRate}%
+- Program-wide click rate: ${metrics.clickRate}%
+- Bounce rate crisis: ${metrics.bounceRate}%
+- Performance trend: ${trends.engagementTrend}
 
-OVERALL METRICS:
-- Total Emails Sent: ${metrics.totalSent}
-- Average Delivery Rate: ${metrics.deliveryRate}%
-- Average Open Rate: ${metrics.openRate}%
-- Average Click Rate: ${metrics.clickRate}%
-- Average Bounce Rate: ${metrics.bounceRate}%
+CLIENT MUST FIX THESE 7 CRITICAL PROGRAM ISSUES:
+Provide exactly 7 urgent fixes in this format:
+"HIGH: [Critical system fix required]"
+"MEDIUM: [Important process fix needed]" 
+"LOW: [Optimization fix recommended]"
 
-CAMPAIGN SUMMARY:
-- Total Campaigns: ${campaignAnalysis.length}
-- Engagement Trend: ${trends.engagementTrend}
-
-TOP PERFORMING CAMPAIGNS:
-${topCampaigns.map(c => `- ${c.name}: ${c.metrics.openRate}% open rate, ${c.metrics.clickRate}% click rate`).join('\n')}
-
-ANALYSIS REQUEST:
-1. Provide strategic recommendations for program improvement
-2. Suggest optimization opportunities for better ROI
-3. Recommend testing strategies and best practices
-
-Please provide comprehensive insights covering program assessment, key findings, strategic recommendations, and priority actions.
-    `.trim();
+Focus on infrastructure, automation, segmentation, and ROI optimization fixes.`;
   }
 
-  // UPDATED PARSING METHODS - MAIN CHANGES HERE
   parseAIResponse(response) {
-    const insights = this.extractKeyInsights(response, 5, 10); // 5-10 points
-    const recommendations = this.extractRecommendations(response, 3, 5); // 3-5 points
-    
+    const items = this.extractPriorityRecommendations(response);
     return {
-      insights: this.limitWordCount(insights, 200), 
-      recommendations: this.limitWordCount(recommendations, 150), // ~80 words for recommendations
-      performance: this.extractPerformanceAssessment(response),
-      benchmarks: this.extractBenchmarks(response)
+      recommendations: items.map((i) => ({
+        priority: i.riskLevel,
+        action: i.recommendation
+      })),
+      riskAssessment: items.reduce((acc, i) => {
+        acc[i.riskLevel.toLowerCase()] = (acc[i.riskLevel.toLowerCase()] || 0) + 1;
+        return acc;
+      }, {})
     };
   }
 
   parseOverallAIResponse(response) {
-    const insights = this.extractKeyInsights(response, 6, 10); // 6-10 points for overall analysis
-    const recommendations = this.extractRecommendations(response, 3, 5); // 3-5 strategic recommendations
-    
+    const items = this.extractPriorityRecommendations(response);
     return {
-      insights: this.limitWordCount(insights, 120),
-      strategicRecommendations: this.limitWordCount(recommendations, 80),
-      keyFindings: this.extractKeyFindings(response, 3, 5),
-      priorityActions: this.extractPriorityActions(response, 2, 4)
+      recommendations: items.map((i) => ({
+        priority: i.riskLevel,
+        action: i.recommendation
+      })),
+      riskAssessment: items.reduce((acc, i) => {
+        acc[i.riskLevel.toLowerCase()] = (acc[i.riskLevel.toLowerCase()] || 0) + 1;
+        return acc;
+      }, {})
     };
   }
 
-  extractKeyInsights(text, minPoints = 5, maxPoints = 10) {
-    const insights = [];
+  extractPriorityRecommendations(text) {
+    const recs = [];
+
+    // Extract priority-based recommendations
+    const recPattern = /(HIGH|MEDIUM|LOW)\s*[:\-]\s*(.*?)(?=\n(?:HIGH|MEDIUM|LOW)|$)/gi;
+    const matches = [...text.matchAll(recPattern)];
     
-    // Look for insights in different patterns
-    const patterns = [
-      /(?:insight|finding|result|shows|indicates|reveals|demonstrates)[:\-\s]*([^.!?]+[.!?])/gi,
-      /(?:performance|engagement|campaign)[:\-\s]*([^.!?]+[.!?])/gi,
-      /(?:rate|percentage|metric)[:\-\s]*([^.!?]+[.!?])/gi
-    ];
-    
-    patterns.forEach(pattern => {
-      const matches = text.match(pattern);
-      if (matches) {
-        matches.forEach(match => {
-          const clean = match.replace(/^[^a-zA-Z]*/, '').trim();
-          if (clean.length > 15 && clean.length < 100 && !insights.includes(clean)) {
-            insights.push(clean);
-          }
+    for (const match of matches) {
+      const [, riskLevel, recommendation] = match;
+      const cleaned = this.cleanText(recommendation || '');
+      if (cleaned.length > 10) {
+        recs.push({ 
+          riskLevel: riskLevel.toUpperCase(), 
+          recommendation: `Fix required: ${cleaned}`
         });
       }
-    });
-    
-    // If not enough insights found, extract from sentences
-    if (insights.length < minPoints) {
-      const sentences = text.split(/[.!?]+/).filter(s => s.trim().length > 20);
-      sentences.forEach(sentence => {
-        const trimmed = sentence.trim();
-        if (trimmed.length > 15 && trimmed.length < 120 && 
-            !insights.some(insight => insight.toLowerCase().includes(trimmed.toLowerCase().substring(0, 20)))) {
-          insights.push(trimmed + '.');
+    }
+
+    // Fallback for unstructured responses
+    if (recs.length < 7) {
+      const lines = text.split('\n').filter(line => line.trim().length > 20);
+      for (const line of lines.slice(0, 7 - recs.length)) {
+        const cleaned = this.cleanText(line);
+        if (cleaned.length > 20) {
+          recs.push({
+            riskLevel: 'MEDIUM',
+            recommendation: `Action needed: ${cleaned}`
+          });
         }
+      }
+    }
+
+    // Ensure we have exactly 7 recommendations
+    const defaultFixes = [
+      'Implement email authentication (SPF, DKIM, DMARC)',
+      'Clean email list and remove invalid addresses',
+      'A/B test subject lines for better open rates',
+      'Optimize send timing based on audience timezone',
+      'Segment email list for personalized content',
+      'Set up automated re-engagement campaigns',
+      'Monitor and improve email deliverability score'
+    ];
+
+    while (recs.length < 7) {
+      recs.push({
+        riskLevel: 'LOW',
+        recommendation: `Critical fix: ${defaultFixes[recs.length % defaultFixes.length]}`
       });
     }
-    
-    // Return the specified number of insights
-    return insights.slice(0, maxPoints).slice(0, Math.max(minPoints, insights.length));
+
+    const priorityOrder = { HIGH: 1, MEDIUM: 2, LOW: 3 };
+    return recs.sort((a, b) => priorityOrder[a.riskLevel] - priorityOrder[b.riskLevel]).slice(0, 7);
   }
 
-  extractRecommendations(text, minRecs = 3, maxRecs = 5) {
-    const recommendations = [];
-    
-    // Look for recommendation patterns
-    const patterns = [
-      /(?:recommend|suggest|should|consider|improve|optimize|try)[:\-\s]*([^.!?]+[.!?])/gi,
-      /(?:^|\n)\s*[\-\•\*]\s*([^.!?\n]+)/gm,
-      /(?:^|\n)\s*\d+\.\s*([^.!?\n]+)/gm
-    ];
-    
-    patterns.forEach(pattern => {
-      const matches = text.match(pattern);
-      if (matches) {
-        matches.forEach(match => {
-          let clean = match.replace(/^[^a-zA-Z]*/, '').replace(/^(recommend|suggest|should|consider|improve|optimize|try)[:\-\s]*/i, '').trim();
-          if (clean.length > 10 && clean.length < 150 && !recommendations.includes(clean)) {
-            // Ensure it ends with proper punctuation
-            if (!clean.endsWith('.') && !clean.endsWith('!') && !clean.endsWith('?')) {
-              clean += '.';
-            }
-            recommendations.push(clean);
-          }
-        });
-      }
-    });
-    
-    // If not enough recommendations, look for action-oriented sentences
-    if (recommendations.length < minRecs) {
-      const actionWords = ['increase', 'decrease', 'test', 'focus', 'target', 'avoid', 'use', 'implement'];
-      const sentences = text.split(/[.!?]+/);
-      
-      sentences.forEach(sentence => {
-        const trimmed = sentence.trim();
-        const hasActionWord = actionWords.some(word => trimmed.toLowerCase().includes(word));
-        
-        if (hasActionWord && trimmed.length > 15 && trimmed.length < 120 && 
-            !recommendations.some(rec => rec.toLowerCase().includes(trimmed.toLowerCase().substring(0, 15)))) {
-          recommendations.push(trimmed + '.');
-        }
-      });
-    }
-    
-    return recommendations.slice(0, maxRecs).slice(0, Math.max(minRecs, recommendations.length));
-  }
-
-  extractKeyFindings(text, minFindings = 3, maxFindings = 5) {
-    const findings = [];
-    
-    const patterns = [
-      /(?:finding|discovered|observed|noted)[:\-\s]*([^.!?]+[.!?])/gi,
-      /(?:data shows|analysis reveals|results indicate)[:\-\s]*([^.!?]+[.!?])/gi
-    ];
-    
-    patterns.forEach(pattern => {
-      const matches = text.match(pattern);
-      if (matches) {
-        matches.forEach(match => {
-          const clean = match.replace(/^[^a-zA-Z]*/, '').trim();
-          if (clean.length > 15 && clean.length < 100 && !findings.includes(clean)) {
-            findings.push(clean);
-          }
-        });
-      }
-    });
-    
-    return findings.slice(0, maxFindings).slice(0, Math.max(minFindings, findings.length));
-  }
-
-  extractPerformanceAssessment(text) {
-    if (text.toLowerCase().includes('excellent') || text.toLowerCase().includes('outstanding')) {
-      return 'Excellent';
-    } else if (text.toLowerCase().includes('good') || text.toLowerCase().includes('above average')) {
-      return 'Above Average';
-    } else if (text.toLowerCase().includes('average') || text.toLowerCase().includes('typical')) {
-      return 'Average';
-    } else if (text.toLowerCase().includes('below') || text.toLowerCase().includes('poor')) {
-      return 'Below Average';
-    }
-    return 'Mixed Results';
-  }
-
-  extractBenchmarks(text) {
-    // Extract any mentioned benchmarks or industry standards
-    const benchmarkMatches = text.match(/(\d+\.?\d*)%/g);
-    return benchmarkMatches ? benchmarkMatches.slice(0, 3) : [];
-  }
-
-  extractPriorityActions(text, minActions = 2, maxActions = 4) {
-    const actions = [];
-    
-    const priorityWords = ['priority', 'urgent', 'immediate', 'critical', 'important', 'first', 'next', 'start', 'begin', 'implement'];
-    const sentences = text.split(/[.!?]+/).map(s => s.trim()).filter(s => s.length > 15);
-    
-    sentences.forEach(sentence => {
-      const hasPriorityWord = priorityWords.some(word => sentence.toLowerCase().includes(word));
-      
-      if (hasPriorityWord && sentence.length > 15 && sentence.length < 150) {
-        let cleanSentence = sentence.replace(/^\s*[^a-zA-Z]*/, '').trim();
-        cleanSentence = cleanSentence.charAt(0).toUpperCase() + cleanSentence.slice(1);
-        
-        if (!actions.some(action => action.toLowerCase().includes(cleanSentence.toLowerCase().substring(0, 15)))) {
-          actions.push(cleanSentence);
-        }
-      }
-    });
-    
-    return actions.slice(0, maxActions);
-  }
-
-  // NEW METHOD: Format everything as clean bullet points
-  formatAsPoints(items) {
-    if (!Array.isArray(items)) return items;
-    
-    return items.map(item => {
-      // Remove any existing bullet points or numbers
-      let cleaned = item.replace(/^[\s\-\•\*\d\.\)]*/, '').trim();
-      
-      // Ensure proper capitalization
-      if (cleaned.length > 0) {
-        cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
-      }
-      
-      // Ensure it ends with period if it doesn't have punctuation
-      if (cleaned && !cleaned.match(/[.!?]$/)) {
-        cleaned += '.';
-      }
-      
-      return cleaned;
-    }).filter(item => item.length > 10); // Filter out too short items
-  }
-
-  limitWordCount(items, maxWords) {
-    if (!Array.isArray(items)) return items;
-    
-    let totalWords = 0;
-    const result = [];
-    
-    for (const item of items) {
-      const words = item.split(/\s+/).length;
-      if (totalWords + words <= maxWords) {
-        result.push(item);
-        totalWords += words;
-      } else {
-        // Try to fit a shortened version
-        const remainingWords = maxWords - totalWords;
-        if (remainingWords > 8) {
-          const shortened = item.split(/\s+/).slice(0, remainingWords - 2).join(' ') + '...';
-          result.push(shortened);
-        }
-        break;
-      }
-    }
-    
-    return result;
+  cleanText(text) {
+    return text
+      .replace(/^[^a-zA-Z]*/, '')
+      .replace(/[.!?]*$/, '')
+      .trim()
+      .replace(/\s+/g, ' ')
+      .substring(0, 200)
+      .trim();
   }
 }
 
